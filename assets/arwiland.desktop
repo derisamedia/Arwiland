@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Arwiland
+GenericName=Dynamic Island & Living Notch
+Comment=Dynamic Island, Living Notch, Lirik Real-Time, Jadwal Sholat & Pusat Notifikasi untuk Linux
+Exec=env GDK_BACKEND=x11 GSK_RENDERER=cairo /home/arwiyah/.local/bin/arwiland
+Icon=arwiland
+Terminal=false
+Categories=Utility;GTK;DesktopSettings;
+Keywords=notch;island;dynamic;lyrics;notifications;sholat;volume;
+StartupNotify=false
+StartupWMClass=arwiland
