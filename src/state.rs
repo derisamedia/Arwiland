@@ -141,8 +141,18 @@ impl Default for AppState {
 
 impl AppState {
     pub fn config_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let dir = PathBuf::from(home).join(".config").join("arwiland");
+        #[cfg(target_os = "windows")]
+        let base_dir = std::env::var("APPDATA")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        #[cfg(not(target_os = "windows"))]
+        let base_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+
+        #[cfg(target_os = "windows")]
+        let dir = PathBuf::from(base_dir).join("arwiland");
+        #[cfg(not(target_os = "windows"))]
+        let dir = PathBuf::from(base_dir).join(".config").join("arwiland");
+
         let _ = fs::create_dir_all(&dir);
         dir.join("state.json")
     }
@@ -185,11 +195,33 @@ impl AppState {
 }
 
 pub fn autostart_desktop_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("autostart")
-        .join("arwiland.desktop")
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join("Arwiland.cmd")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join("Library")
+            .join("LaunchAgents")
+            .join("id.arwiland.DynamicIsland.plist")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".config")
+            .join("autostart")
+            .join("arwiland.desktop")
+    }
 }
 
 pub fn is_autostart_installed() -> bool {
@@ -197,50 +229,83 @@ pub fn is_autostart_installed() -> bool {
 }
 
 pub fn resolve_startup_exec_command() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let local_bin = PathBuf::from(home)
-        .join(".local")
-        .join("bin")
-        .join("arwiland");
-    if local_bin.exists() {
-        return format!(
-            "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
-            local_bin.to_string_lossy()
-        );
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(project_root) = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-        {
-            let run_script = project_root.join("run.sh");
-            if run_script.exists() {
-                return format!("\"{}\"", run_script.to_string_lossy());
-            }
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let local_bin = PathBuf::from(home)
+            .join(".local")
+            .join("bin")
+            .join("arwiland");
+        if local_bin.exists() {
+            return format!(
+                "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
+                local_bin.to_string_lossy()
+            );
         }
-        return format!(
-            "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
-            exe.to_string_lossy()
-        );
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(project_root) = exe
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+            {
+                let run_script = project_root.join("run.sh");
+                if run_script.exists() {
+                    return format!("\"{}\"", run_script.to_string_lossy());
+                }
+            }
+            return format!(
+                "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
+                exe.to_string_lossy()
+            );
+        }
+        "arwiland".to_string()
     }
-    "arwiland".to_string()
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "arwiland".to_string())
+    }
 }
 
 pub fn set_autostart_enabled(enabled: bool) -> bool {
-    let desktop_path = autostart_desktop_path();
+    let autostart_path = autostart_desktop_path();
     if enabled {
-        if let Some(parent) = desktop_path.parent() {
+        if let Some(parent) = autostart_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let exec_cmd = resolve_startup_exec_command();
-        let desktop_content = format!(
+
+        #[cfg(target_os = "windows")]
+        let content = format!("@echo off\r\nstart \"\" \"{}\"\r\n", exec_cmd);
+
+        #[cfg(target_os = "macos")]
+        let content = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+                 <key>Label</key>\n\
+                 <string>id.arwiland.DynamicIsland</string>\n\
+                 <key>ProgramArguments</key>\n\
+                 <array>\n\
+                     <string>{}</string>\n\
+                 </array>\n\
+                 <key>RunAtLoad</key>\n\
+                 <true/>\n\
+             </dict>\n\
+             </plist>\n",
+            exec_cmd
+        );
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let content = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Version=1.0\n\
              Name=Arwiland\n\
              GenericName=Dynamic Island & Living Notch\n\
-             Comment=Dynamic Island & Living Notch untuk Linux\n\
+             Comment=Dynamic Island & Living Notch\n\
              Exec={}\n\
              Icon=arwiland\n\
              Terminal=false\n\
@@ -250,9 +315,10 @@ pub fn set_autostart_enabled(enabled: bool) -> bool {
              X-GNOME-Autostart-Delay=2\n",
             exec_cmd
         );
-        fs::write(&desktop_path, desktop_content).is_ok()
-    } else if desktop_path.exists() {
-        fs::remove_file(&desktop_path).is_ok()
+
+        fs::write(&autostart_path, content).is_ok()
+    } else if autostart_path.exists() {
+        fs::remove_file(&autostart_path).is_ok()
     } else {
         true
     }

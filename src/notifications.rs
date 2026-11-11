@@ -317,6 +317,7 @@ impl NotificationHub {
         guard.seq = guard.seq.wrapping_add(1);
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_dbus_listener(&self) {
         let hub = self.clone();
         thread::spawn(move || loop {
@@ -346,6 +347,9 @@ impl NotificationHub {
             thread::sleep(Duration::from_millis(800));
         });
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_dbus_listener(&self) {}
 }
 
 #[derive(PartialEq)]
@@ -675,15 +679,22 @@ pub fn strip_html_and_trim(input: &str) -> String {
 /// Configures GNOME Shell's built-in notification banner popup (`org.gnome.desktop.notifications show-banners`)
 /// so that when Arwiland handles notifications inside the Dynamic Island Notch, GNOME doesn't draw a duplicate popup on top.
 pub fn set_system_notification_banners_hidden(hide_banners: bool) {
-    let val = if hide_banners { "false" } else { "true" };
-    thread::spawn(move || {
-        let _ = Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.notifications",
-                "show-banners",
-                val,
-            ])
-            .status();
-    });
+    #[cfg(target_os = "linux")]
+    {
+        let val = if hide_banners { "false" } else { "true" };
+        thread::spawn(move || {
+            let _ = Command::new("gsettings")
+                .args([
+                    "set",
+                    "org.gnome.desktop.notifications",
+                    "show-banners",
+                    val,
+                ])
+                .status();
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = hide_banners;
+    }
 }

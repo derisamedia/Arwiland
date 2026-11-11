@@ -90,7 +90,10 @@ pub fn spawn_background_monitor() -> Arc<Mutex<BgSharedData>> {
                 }
             }
 
-            thread::sleep(Duration::from_millis(350));
+            #[cfg(target_os = "linux")]
+            thread::sleep(Duration::from_millis(150));
+            #[cfg(not(target_os = "linux"))]
+            thread::sleep(Duration::from_millis(450));
         }
     });
 

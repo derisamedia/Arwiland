@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -50,9 +51,7 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
                 }
 
                 if mute_tog {
-                    let _ = Command::new("wpctl")
-                        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
-                        .status();
+                    apply_platform_mute_toggle();
                 }
 
                 // Drain any newer volume value that arrived while mute was toggling
@@ -63,37 +62,98 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
 
                 if v >= 0 && v != last_applied_vol {
                     last_applied_vol = v;
-                    let arg = format!("{}%", v.clamp(0, 100));
-                    let _ = Command::new("wpctl")
-                        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &arg])
-                        .status();
+                    apply_platform_volume(v.clamp(0, 100) as u32);
                 }
             }
         });
 
-        // 2. Fast Dedicated Volume Monitor Thread (45ms poll, independent of slow MPRIS/D-Bus)
-        thread::spawn(|| loop {
-            let since_user_ms =
-                now_epoch_ms().saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
-            if since_user_ms >= 220 {
-                if let Some((pct, muted)) = query_wpctl_volume() {
-                    let since_after =
-                        now_epoch_ms().saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
-                    if since_after >= 220 {
-                        LIVE_HW_VOL.store(pct, Ordering::Release);
-                        LIVE_HW_MUTED.store(muted, Ordering::Release);
-                        LIVE_HW_INITIALIZED.store(true, Ordering::Release);
+        // 2. Fast Dedicated Volume Monitor Thread
+        thread::spawn(|| {
+            #[cfg(target_os = "linux")]
+            let poll_ms = 45;
+            #[cfg(not(target_os = "linux"))]
+            let poll_ms = 500;
+
+            loop {
+                let since_user_ms =
+                    now_epoch_ms().saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
+                if since_user_ms >= 220 {
+                    if let Some((pct, muted)) = query_platform_volume() {
+                        let since_after = now_epoch_ms()
+                            .saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
+                        if since_after >= 220 {
+                            LIVE_HW_VOL.store(pct, Ordering::Release);
+                            LIVE_HW_MUTED.store(muted, Ordering::Release);
+                            LIVE_HW_INITIALIZED.store(true, Ordering::Release);
+                        }
                     }
                 }
+                thread::sleep(Duration::from_millis(poll_ms));
             }
-            thread::sleep(Duration::from_millis(45));
         });
 
         sig
     })
 }
 
-fn query_wpctl_volume() -> Option<(u32, bool)> {
+#[cfg(target_os = "linux")]
+fn apply_platform_mute_toggle() {
+    let _ = Command::new("wpctl")
+        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+fn apply_platform_mute_toggle() {
+    let muted = LIVE_HW_MUTED.load(Ordering::Acquire);
+    let script = if muted {
+        "set volume with output muted"
+    } else {
+        "set volume without output muted"
+    };
+    let _ = Command::new("osascript").args(["-e", script]).status();
+}
+
+#[cfg(target_os = "windows")]
+fn apply_platform_mute_toggle() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let _ = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(New-Object -ComObject WScript.Shell).SendKeys([char]173)",
+        ])
+        .status();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn apply_platform_mute_toggle() {}
+
+#[cfg(target_os = "linux")]
+fn apply_platform_volume(vol: u32) {
+    let arg = format!("{}%", vol);
+    let _ = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &arg])
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+fn apply_platform_volume(vol: u32) {
+    let script = format!("set volume output volume {}", vol);
+    let _ = Command::new("osascript").args(["-e", &script]).status();
+}
+
+#[cfg(target_os = "windows")]
+fn apply_platform_volume(_vol: u32) {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn apply_platform_volume(_vol: u32) {}
+
+#[cfg(target_os = "linux")]
+fn query_platform_volume() -> Option<(u32, bool)> {
     let out = Command::new("wpctl")
         .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
         .output()
@@ -110,6 +170,33 @@ fn query_wpctl_volume() -> Option<(u32, bool)> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn query_platform_volume() -> Option<(u32, bool)> {
+    let out = Command::new("osascript")
+        .args([
+            "-e",
+            "set v to get volume settings\nreturn (output volume of v as string) & \" \" & (output muted of v as string)",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.split_whitespace();
+    let pct = parts.next()?.parse::<u32>().ok()?;
+    let muted = parts.next().unwrap_or("false") == "true";
+    Some((pct.min(100), muted))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn query_platform_volume() -> Option<(u32, bool)> {
+    Some((
+        LIVE_HW_VOL.load(Ordering::Acquire),
+        LIVE_HW_MUTED.load(Ordering::Acquire),
+    ))
 }
 
 /// Instant, lock-free volume read for the 60FPS UI tick loop.
@@ -173,7 +260,7 @@ impl Default for CpuTracker {
 impl CpuTracker {
     pub fn new() -> Self {
         let _ = ensure_volume_threads();
-        let (idle, total) = Self::read_proc_stat().unwrap_or((0, 0));
+        let (idle, total) = Self::read_cpu_times().unwrap_or((0, 0));
         Self {
             prev_idle: idle,
             prev_total: total,
@@ -181,25 +268,9 @@ impl CpuTracker {
         }
     }
 
-    fn read_proc_stat() -> Option<(u64, u64)> {
-        let content = fs::read_to_string("/proc/stat").ok()?;
-        let first_line = content.lines().next()?;
-        let parts: Vec<u64> = first_line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect();
-        if parts.len() < 4 {
-            return None;
-        }
-        let idle = parts[3] + parts.get(4).copied().unwrap_or(0);
-        let total: u64 = parts.iter().sum();
-        Some((idle, total))
-    }
-
     pub fn sample_metrics(&mut self) -> SystemMetrics {
         let mut cpu_usage = 0.0;
-        if let Some((idle, total)) = Self::read_proc_stat() {
+        if let Some((idle, total)) = Self::read_cpu_times() {
             let diff_idle = idle.saturating_sub(self.prev_idle);
             let diff_total = total.saturating_sub(self.prev_total);
             if diff_total > 0 {
@@ -229,6 +300,59 @@ impl CpuTracker {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn read_cpu_times() -> Option<(u64, u64)> {
+        let content = fs::read_to_string("/proc/stat").ok()?;
+        let first_line = content.lines().next()?;
+        let parts: Vec<u64> = first_line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        let idle = parts[3] + parts.get(4).copied().unwrap_or(0);
+        let total: u64 = parts.iter().sum();
+        Some((idle, total))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn read_cpu_times() -> Option<(u64, u64)> {
+        #[repr(C)]
+        #[derive(Default, Copy, Clone)]
+        struct FILETIME {
+            dw_low_date_time: u32,
+            dw_high_date_time: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetSystemTimes(
+                lpIdleTime: *mut FILETIME,
+                lpKernelTime: *mut FILETIME,
+                lpUserTime: *mut FILETIME,
+            ) -> i32;
+        }
+        let mut idle = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        if ok == 0 {
+            return None;
+        }
+        let to_u64 =
+            |ft: FILETIME| ((ft.dw_high_date_time as u64) << 32) | (ft.dw_low_date_time as u64);
+        let idle_u = to_u64(idle);
+        let total_u = to_u64(kernel) + to_u64(user);
+        Some((idle_u, total_u))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn read_cpu_times() -> Option<(u64, u64)> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn read_meminfo() -> (f32, f32, f32) {
         let content = match fs::read_to_string("/proc/meminfo") {
             Ok(c) => c,
@@ -261,6 +385,46 @@ impl CpuTracker {
         (pct, used_gb, total_gb)
     }
 
+    #[cfg(target_os = "windows")]
+    fn read_meminfo() -> (f32, f32, f32) {
+        #[repr(C)]
+        struct MEMORYSTATUSEX {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+        }
+        unsafe {
+            let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+            mem.dw_length = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut mem) != 0 && mem.ull_total_phys > 0 {
+                let used = mem.ull_total_phys.saturating_sub(mem.ull_avail_phys);
+                let gb = 1024.0 * 1024.0 * 1024.0;
+                return (
+                    mem.dw_memory_load as f32,
+                    used as f32 / gb,
+                    mem.ull_total_phys as f32 / gb,
+                );
+            }
+        }
+        (0.0, 0.0, 0.0)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn read_meminfo() -> (f32, f32, f32) {
+        (0.0, 0.0, 0.0)
+    }
+
+    #[cfg(target_os = "linux")]
     fn read_battery() -> (Option<u32>, bool) {
         let base = std::path::Path::new("/sys/class/power_supply");
         if let Ok(entries) = fs::read_dir(base) {
@@ -286,6 +450,56 @@ impl CpuTracker {
         (None, false)
     }
 
+    #[cfg(target_os = "windows")]
+    fn read_battery() -> (Option<u32>, bool) {
+        #[repr(C)]
+        struct SYSTEM_POWER_STATUS {
+            ac_line_status: u8,
+            battery_flag: u8,
+            battery_life_percent: u8,
+            system_status_flag: u8,
+            battery_life_time: u32,
+            battery_full_life_time: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetSystemPowerStatus(lpSystemPowerStatus: *mut SYSTEM_POWER_STATUS) -> i32;
+        }
+        unsafe {
+            let mut sps: SYSTEM_POWER_STATUS = std::mem::zeroed();
+            if GetSystemPowerStatus(&mut sps) != 0
+                && sps.battery_flag != 128
+                && sps.battery_life_percent <= 100
+            {
+                let charging = sps.ac_line_status == 1 || (sps.battery_flag & 8) != 0;
+                return (Some(sps.battery_life_percent as u32), charging);
+            }
+        }
+        (None, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_battery() -> (Option<u32>, bool) {
+        if let Ok(out) = Command::new("pmset").args(["-g", "batt"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for tok in text.split_whitespace() {
+                if let Some(pct_str) = tok.strip_suffix("%;") {
+                    if let Ok(pct) = pct_str.parse::<u32>() {
+                        let charging = text.contains("AC Power") || text.contains("charging");
+                        return (Some(pct.min(100)), charging);
+                    }
+                }
+            }
+        }
+        (None, false)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    fn read_battery() -> (Option<u32>, bool) {
+        (None, false)
+    }
+
+    #[cfg(target_os = "linux")]
     fn read_uptime() -> String {
         if let Ok(content) = fs::read_to_string("/proc/uptime") {
             if let Some(first) = content.split_whitespace().next() {
@@ -297,6 +511,23 @@ impl CpuTracker {
                 }
             }
         }
+        "0j 0m".to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn read_uptime() -> String {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetTickCount64() -> u64;
+        }
+        let secs = unsafe { GetTickCount64() } / 1000;
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{}j {}m", hours, mins)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn read_uptime() -> String {
         "0j 0m".to_string()
     }
 }

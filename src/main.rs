@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod lyrics;
 mod mpris;
 mod notifications;
@@ -44,6 +46,7 @@ use x11_helper::{
 };
 
 fn main() {
+    #[cfg(target_os = "linux")]
     if std::env::var("DISPLAY").is_ok() {
         std::env::set_var("GDK_BACKEND", "x11");
     }
@@ -997,14 +1000,23 @@ fn build_ui(app: &gtk4::Application) {
                     }
                 }
 
+                let mut media_state_dirty = false;
                 if let Ok(guard) = bg_mon.try_lock() {
                     if guard.media_seq != st.last_seen_seq {
                         st.last_seen_seq = guard.media_seq;
                         let new_m = guard.media.clone();
                         let track_changed = st.cached_media.title != new_m.title
                             || st.cached_media.artist != new_m.artist;
-                        if (st.interp_pos_sec - new_m.position_f64).abs() > 0.85 || track_changed {
+                        let play_state_changed = st.cached_media.playing != new_m.playing;
+                        if (st.interp_pos_sec - new_m.position_f64).abs() > 0.85
+                            || track_changed
+                            || play_state_changed
+                            || !new_m.playing
+                        {
                             st.interp_pos_sec = new_m.position_f64;
+                        }
+                        if track_changed || play_state_changed {
+                            media_state_dirty = true;
                         }
                         if track_changed {
                             st.prev_prev_lyric.clear();
@@ -1057,7 +1069,7 @@ fn build_ui(app: &gtk4::Application) {
                 }
 
                 let is_playing = st.cached_media.has_player && st.cached_media.playing;
-                let mut redraw = false;
+                let mut redraw = media_state_dirty;
 
                 // Smoothly interpolate displayed volume bar when not actively dragging
                 if !st.vol_osd_dragging {
@@ -1647,7 +1659,12 @@ fn build_ui(app: &gtk4::Application) {
 
                 let p1 = f_item.path.clone();
                 open_b.connect_clicked(move |_| {
+                    #[cfg(target_os = "linux")]
                     let _ = Command::new("xdg-open").arg(&p1).spawn();
+                    #[cfg(target_os = "macos")]
+                    let _ = Command::new("open").arg(&p1).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = Command::new("explorer").arg(&p1).spawn();
                 });
 
                 let p2 = f_item.path.clone();

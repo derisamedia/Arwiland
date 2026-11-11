@@ -2,16 +2,18 @@
 name = "arwiland"
 version = "0.1.0"
 edition = "2021"
-description = "Arwiland - Native Linux Dynamic Island & Living Notch (inspired by Nusa & ReyLand) built with Rust & GTK4"
+description = "Arwiland - Cross-Platform Dynamic Island & Living Notch (Linux, Windows, macOS) built with Rust & GTK4"
 authors = ["Arwiyah"]
 
 [dependencies]
 gtk4 = { version = "0.9", features = ["v4_10"] }
-gdk4-x11 = "0.9"
 glib = "0.20"
 gio = "0.20"
 cairo-rs = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gdk4-x11 = "0.9"
 libc = "0.2"
