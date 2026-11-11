@@ -319,21 +319,22 @@ pub fn send_mpris_command(method: &str) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let vk = match method {
-            "PlayPause" => 179, // VK_MEDIA_PLAY_PAUSE
-            "Next" => 176,      // VK_MEDIA_NEXT_TRACK
-            "Previous" => 177,  // VK_MEDIA_PREV_TRACK
+        #[link(name = "user32")]
+        extern "system" {
+            fn keybd_event(bVk: u8, bScan: u8, dwFlags: u32, dwExtraInfo: usize);
+        }
+        const KEYEVENTF_KEYUP: u32 = 0x0002;
+        let vk: u8 = match method {
+            "PlayPause" => 0xB3, // VK_MEDIA_PLAY_PAUSE
+            "Next" => 0xB0,      // VK_MEDIA_NEXT_TRACK
+            "Previous" => 0xB1,  // VK_MEDIA_PREV_TRACK
             _ => return false,
         };
-        let ps = format!("(New-Object -ComObject WScript.Shell).SendKeys([char]{})", vk);
-        Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        unsafe {
+            keybd_event(vk, 0, 0, 0);
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        }
+        true
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

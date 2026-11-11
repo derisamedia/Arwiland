@@ -15,7 +15,7 @@ pub fn get_primary_monitor_geometry() -> (i32, i32, i32, i32) {
 }
 
 /// Sets the clickable/hoverable input region of the 32-bit RGBA transparent window.
-/// Supported across GDK4 backends (Linux X11/Wayland, Windows Win32, macOS Quartz).
+/// Supported natively across GDK4 backends (Linux X11, Windows Win32, macOS Quartz).
 pub fn update_pill_input_region(
     window: &gtk4::ApplicationWindow,
     canvas_width: i32,
@@ -32,7 +32,7 @@ pub fn update_pill_input_region(
 }
 
 // =============================================================================
-// LINUX (X11 OVERLAY BACKEND)
+// 1. LINUX NATIVE X11 OVERLAY BACKEND (`libX11`)
 // =============================================================================
 #[cfg(target_os = "linux")]
 mod platform {
@@ -233,7 +233,7 @@ mod platform {
 }
 
 // =============================================================================
-// WINDOWS (WIN32 TOPMOST OVERLAY BACKEND)
+// 2. WINDOWS NATIVE WIN32 API OVERLAY BACKEND (`user32.dll`)
 // =============================================================================
 #[cfg(target_os = "windows")]
 mod platform {
@@ -333,11 +333,42 @@ mod platform {
 }
 
 // =============================================================================
-// MACOS (QUARTZ / APPKIT STATUS-BAR OVERLAY BACKEND)
+// 3. MACOS NATIVE APPKIT / COCOA OVERLAY BACKEND (`NSWindow` via `libobjc`)
 // =============================================================================
 #[cfg(target_os = "macos")]
 mod platform {
+    use super::get_primary_monitor_geometry;
+    use gtk4::glib::translate::ToGlibPtr;
     use gtk4::prelude::*;
+    use std::ffi::{c_char, c_void};
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    extern "C" {
+        fn gdk_macos_surface_get_native_window(surface: *mut c_void) -> *mut c_void;
+    }
+
+    fn get_nswindow(window: &gtk4::ApplicationWindow) -> Option<*mut c_void> {
+        let surface = window.surface()?;
+        let ptr: *mut gtk4::gdk::ffi::GdkSurface = surface.to_glib_none().0;
+        let nswin = unsafe { gdk_macos_surface_get_native_window(ptr as *mut c_void) };
+        if nswin.is_null() {
+            None
+        } else {
+            Some(nswin)
+        }
+    }
 
     pub fn configure_pre_map_overlay(
         window: &gtk4::ApplicationWindow,
@@ -350,11 +381,47 @@ mod platform {
 
     pub fn setup_top_center_overlay(
         window: &gtk4::ApplicationWindow,
-        _canvas_width: i32,
+        canvas_width: i32,
         _canvas_height: i32,
-        _y_offset: i32,
+        y_offset: i32,
     ) {
-        window.present();
+        let Some(nswin) = get_nswindow(window) else {
+            return;
+        };
+
+        let (mon_x, mon_y, mon_w, mon_h) = get_primary_monitor_geometry();
+        let target_x = (mon_x + (mon_w - canvas_width) / 2) as f64;
+        // Cocoa screen coordinates have origin at bottom-left of primary screen
+        let target_top_y = (mon_h - mon_y - y_offset) as f64;
+
+        unsafe {
+            let msg_set_level: unsafe extern "C" fn(*mut c_void, *mut c_void, isize) =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_set_behavior: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_set_top_left: unsafe extern "C" fn(*mut c_void, *mut c_void, NSPoint) =
+                std::mem::transmute(objc_msgSend as *const ());
+
+            // NSStatusWindowLevel = 25 (floats above macOS menu bar & aligns with MacBook Notch)
+            let sel_level = sel_registerName(b"setLevel:\0".as_ptr() as *const c_char);
+            msg_set_level(nswin, sel_level, 25);
+
+            // CanJoinAllSpaces (1 << 0) | Stationary (1 << 4) | FullScreenAuxiliary (1 << 8)
+            let sel_behav =
+                sel_registerName(b"setCollectionBehavior:\0".as_ptr() as *const c_char);
+            msg_set_behavior(nswin, sel_behav, (1 << 0) | (1 << 4) | (1 << 8));
+
+            let sel_pos =
+                sel_registerName(b"setFrameTopLeftPoint:\0".as_ptr() as *const c_char);
+            msg_set_top_left(
+                nswin,
+                sel_pos,
+                NSPoint {
+                    x: target_x,
+                    y: target_top_y,
+                },
+            );
+        }
     }
 
     pub fn grab_keyboard_focus(window: &gtk4::ApplicationWindow) {
@@ -362,9 +429,6 @@ mod platform {
     }
 }
 
-// =============================================================================
-// FALLBACK FOR OTHER PLATFORMS
-// =============================================================================
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod platform {
     use gtk4::prelude::*;

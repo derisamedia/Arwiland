@@ -1,4 +1,4 @@
-name: Cross-Platform Installer Build (Linux .deb, Windows Setup.exe, macOS .dmg)
+name: Cross-Platform Native Build & Release (v0.0.1)
 
 on:
   push:
@@ -13,23 +13,24 @@ permissions:
 
 jobs:
   # ===========================================================================
-  # 1. LINUX BUILD (.deb Installer + Portable .tar.gz)
+  # 1. LINUX NATIVE BUILD (.deb + .rpm Installers)
   # ===========================================================================
   build-linux:
-    name: Build Linux (.deb Installer)
+    name: Build Linux (.deb & .rpm)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install GTK4 & X11 Dependencies
+      - name: Install GTK4, X11 & RPM Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libx11-dev pkg-config
+          sudo apt-get install -y libgtk-4-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libx11-dev pkg-config rpm
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
-      - name: Build Release Binary
+      - name: Build Native Release Binary
         run: cargo build --release
-      - name: Package Debian/Ubuntu Installer (.deb)
+      - name: Package Debian/Ubuntu (.deb) & Fedora/RHEL (.rpm) Installers
         run: |
+          # --- 1. Build .deb Package ---
           mkdir -p pkg-deb/DEBIAN
           mkdir -p pkg-deb/usr/bin
           mkdir -p pkg-deb/usr/share/applications
@@ -46,7 +47,7 @@ jobs:
           Version=1.0
           Name=Arwiland
           GenericName=Dynamic Island & Living Notch
-          Comment=Dynamic Island & Living Notch
+          Comment=Native Dynamic Island & Living Notch
           Exec=env GDK_BACKEND=x11 GSK_RENDERER=cairo /usr/bin/arwiland
           Icon=arwiland
           Terminal=false
@@ -58,28 +59,66 @@ jobs:
 
           cat << 'EOF' > pkg-deb/DEBIAN/control
           Package: arwiland
-          Version: 0.1.0
+          Version: 0.0.1
           Section: utils
           Priority: optional
           Architecture: amd64
           Depends: libgtk-4-1, libcairo2, libpango-1.0-0, libgdk-pixbuf-2.0-0, libglib2.0-0, libx11-6, curl
           Maintainer: Arwiyah <yuimizuno86@gmail.com>
-          Description: Arwiland - Dynamic Island & Living Notch
+          Description: Arwiland - Native Dynamic Island & Living Notch
            Native Dynamic Island & Living Notch with Media Player, Word-Synced Lyrics,
            Notifications, Pomodoro, To-Do, File Shelf, and Prayer Times.
           EOF
 
           dpkg-deb --build pkg-deb Arwiland-Linux-amd64.deb
-      - name: Upload Linux Installer Artifact
+
+          # --- 2. Build .rpm Package (Fedora / RHEL / openSUSE) ---
+          RPM_TOP="$(pwd)/rpmbuild"
+          mkdir -p "$RPM_TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          cat << EOF > "$RPM_TOP/SPECS/arwiland.spec"
+          Name:           arwiland
+          Version:        0.0.1
+          Release:        1
+          Summary:        Arwiland - Native Dynamic Island & Living Notch
+          License:        MIT
+          BuildArch:      x86_64
+          AutoReqProv:    no
+          Requires:       gtk4, cairo, pango, gdk-pixbuf2, glib2, libX11, curl
+
+          %description
+          Native Dynamic Island & Living Notch with Media Player, Word-Synced Lyrics,
+          Notifications, Pomodoro, To-Do, File Shelf, and Prayer Times.
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          mkdir -p %{buildroot}/usr/share/icons/hicolor/scalable/apps
+          mkdir -p %{buildroot}/etc/xdg/autostart
+          install -m 755 "$(pwd)/target/release/arwiland" %{buildroot}/usr/bin/arwiland
+          install -m 644 "$(pwd)/assets/arwiland.svg" %{buildroot}/usr/share/icons/hicolor/scalable/apps/arwiland.svg
+          install -m 644 "$(pwd)/pkg-deb/usr/share/applications/arwiland.desktop" %{buildroot}/usr/share/applications/arwiland.desktop
+          install -m 644 "$(pwd)/pkg-deb/etc/xdg/autostart/arwiland.desktop" %{buildroot}/etc/xdg/autostart/arwiland.desktop
+
+          %files
+          /usr/bin/arwiland
+          /usr/share/applications/arwiland.desktop
+          /usr/share/icons/hicolor/scalable/apps/arwiland.svg
+          /etc/xdg/autostart/arwiland.desktop
+          EOF
+
+          rpmbuild --define "_topdir $RPM_TOP" -bb "$RPM_TOP/SPECS/arwiland.spec"
+          cp "$RPM_TOP"/RPMS/x86_64/*.rpm Arwiland-Linux-x86_64.rpm
+      - name: Upload Linux Installers (.deb & .rpm)
         uses: actions/upload-artifact@v4
         with:
-          name: Arwiland-Linux-Installer-deb
+          name: Arwiland-Linux-Installers
           path: |
             Arwiland-Linux-amd64.deb
-            target/release/arwiland
+            Arwiland-Linux-x86_64.rpm
 
   # ===========================================================================
-  # 2. WINDOWS BUILD (Standalone Setup.exe Installer with Bundled GTK4 + Icons)
+  # 2. WINDOWS NATIVE BUILD (Standalone Setup.exe Installer)
   # ===========================================================================
   build-windows:
     name: Build Windows Installer (Setup.exe)
@@ -89,7 +128,7 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup MSYS2 (UCRT64), GTK4 & NSIS Installer Builder
+      - name: Setup Native Windows UCRT64 Toolchain & NSIS
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -101,9 +140,9 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-rust
             mingw-w64-ucrt-x86_64-nsis
-      - name: Build Windows Release (.exe)
+      - name: Build Native Windows Release (.exe)
         run: cargo build --release
-      - name: Bundle Standalone Runtime (DLLs, Icons, Schemas) & Build Setup.exe
+      - name: Bundle Native Runtime & Build Setup.exe
         run: |
           mkdir -p win-bundle/bin
           mkdir -p win-bundle/share/glib-2.0/schemas
@@ -112,11 +151,10 @@ jobs:
 
           cp target/release/arwiland.exe win-bundle/bin/arwiland.exe
 
-          # Copy all required UCRT64 DLLs automatically
+          # Bundle required native Windows DLLs
           ldd target/release/arwiland.exe | awk '/\/ucrt64\/bin\// {print $3}' | xargs -I{} cp -f "{}" win-bundle/bin/
-          cp -f /ucrt64/bin/gdbus.exe win-bundle/bin/ 2>/dev/null || true
 
-          # Copy GSettings schemas & Adwaita symbolic icons so UI icons work out-of-the-box
+          # Bundle GSettings schemas & Adwaita symbolic icons
           cp -f /ucrt64/share/glib-2.0/schemas/gschemas.compiled win-bundle/share/glib-2.0/schemas/
           cp -rf /ucrt64/share/icons/Adwaita win-bundle/share/icons/ 2>/dev/null || true
           cp -rf /ucrt64/share/icons/hicolor win-bundle/share/icons/ 2>/dev/null || true
@@ -124,7 +162,7 @@ jobs:
 
           cat << 'EOF' > installer.nsi
           !include "MUI2.nsh"
-          Name "Arwiland"
+          Name "Arwiland v0.0.1"
           OutFile "Arwiland-Windows-Setup.exe"
           InstallDir "$LOCALAPPDATA\Programs\Arwiland"
           RequestExecutionLevel user
@@ -151,7 +189,7 @@ jobs:
             CreateShortCut "$SMPROGRAMS\Arwiland\Arwiland.lnk" "$INSTDIR\bin\arwiland.exe"
             CreateShortCut "$DESKTOP\Arwiland.lnk" "$INSTDIR\bin\arwiland.exe"
 
-            ; Auto-run on Windows Startup ("langsung nempel" saat laptop nyala)
+            ; Auto-run on Windows Startup
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Arwiland" '"$INSTDIR\bin\arwiland.exe"'
 
             ; Register Uninstaller in Windows Installed Apps
@@ -160,7 +198,7 @@ jobs:
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "UninstallString" '"$INSTDIR\Uninstall.exe"'
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayIcon" "$INSTDIR\bin\arwiland.exe"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "Publisher" "Arwiyah"
-            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayVersion" "0.1.0"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayVersion" "0.0.1"
           SectionEnd
 
           Section "Uninstall"
@@ -177,24 +215,24 @@ jobs:
       - name: Upload Windows Setup.exe Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Arwiland-Windows-Installer-exe
+          name: Arwiland-Windows-Installer
           path: Arwiland-Windows-Setup.exe
 
   # ===========================================================================
-  # 3. MACOS BUILD (Standalone Arwiland.app inside Arwiland-macOS.dmg)
+  # 3. MACOS NATIVE BUILD (Standalone Arwiland.app inside Arwiland-macOS.dmg)
   # ===========================================================================
   build-macos:
     name: Build macOS Installer (.dmg)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install GTK4 & dylibbundler via Homebrew
+      - name: Install GTK4 & dylibbundler
         run: brew install gtk4 adwaita-icon-theme pkg-config cairo pango gdk-pixbuf glib dylibbundler
       - name: Install Rust Stable
         uses: dtolnay/rust-toolchain@stable
-      - name: Build Release Binary
+      - name: Build Native macOS Release Binary
         run: cargo build --release
-      - name: Bundle Standalone Arwiland.app & Package .dmg
+      - name: Bundle Native Arwiland.app & Package .dmg
         run: |
           APP_DIR="dmg-staging/Arwiland.app/Contents"
           mkdir -p "$APP_DIR/MacOS"
@@ -205,7 +243,6 @@ jobs:
           cp target/release/arwiland "$APP_DIR/MacOS/arwiland-bin"
           chmod +x "$APP_DIR/MacOS/arwiland-bin"
 
-          # Bundle Homebrew dylibs inside Arwiland.app so Mac users don't need Homebrew
           dylibbundler -od -b \
             -x "$APP_DIR/MacOS/arwiland-bin" \
             -d "$APP_DIR/Frameworks/" \
@@ -239,9 +276,9 @@ jobs:
               <key>CFBundleName</key>
               <string>Arwiland</string>
               <key>CFBundleVersion</key>
-              <string>0.1.0</string>
+              <string>0.0.1</string>
               <key>CFBundleShortVersionString</key>
-              <string>0.1.0</string>
+              <string>0.0.1</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>LSUIElement</key>
@@ -253,18 +290,18 @@ jobs:
           EOF
 
           ln -s /Applications dmg-staging/Applications
-          hdiutil create -volname "Arwiland Installer" -srcfolder dmg-staging -ov -format UDZO Arwiland-macOS.dmg
+          hdiutil create -volname "Arwiland v0.0.1" -srcfolder dmg-staging -ov -format UDZO Arwiland-macOS.dmg
       - name: Upload macOS .dmg Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Arwiland-macOS-Installer-dmg
+          name: Arwiland-macOS-Installer
           path: Arwiland-macOS.dmg
 
   # ===========================================================================
-  # 4. PUBLISH AUTOMATIC GITHUB RELEASE (Downloadable on GitHub Releases Page)
+  # 4. PUBLISH AUTOMATIC GITHUB RELEASE (v0.0.1)
   # ===========================================================================
   publish-release:
-    name: Publish Installers to GitHub Releases
+    name: Publish v0.0.1 to GitHub Releases
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
@@ -274,21 +311,27 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Create or Update Latest GitHub Release
+      - name: Create or Update GitHub Release v0.0.1
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
-          name: "Arwiland v0.1.0 — Cross-Platform Installer (Windows, macOS, Linux)"
+          tag_name: v0.0.1
+          name: "Arwiland v0.0.1 — Native Cross-Platform Installer (Windows, macOS, Linux)"
           body: |
-            ## 🏝️ Download Installer Siap Pakai (Tanpa Perlu Install MSYS2 / Homebrew / Rust)
-            Pilih sesuai sistem operasi kamu, klik dua kali untuk install, dan **Arwiland** langsung terpasang di atas layar & berjalan otomatis saat perangkat dinyalakan:
+            ## 🏝️ Arwiland v0.0.1 (Rilis Pertama / Uji Coba)
+            Aplikasi **100% Native** (tanpa emulasi) untuk **Windows**, **macOS**, dan **Linux**. Pilih installer sesuai sistem operasi kamu:
 
-            - 🪟 **Windows (10/11)**: Unduh **`Arwiland-Windows-Setup.exe`** (Installer lengkap dengan GTK4 runtime, shortcut Desktop/Start Menu, dan Auto-Start).
-            - 🍎 **macOS (Apple Silicon & Intel)**: Unduh **`Arwiland-macOS.dmg`** (Buka dan tarik `Arwiland.app` ke folder `Applications`).
-            - 🐧 **Linux (Ubuntu / Debian / Mint)**: Unduh **`Arwiland-Linux-amd64.deb`** (Klik 2x untuk install atau `sudo apt install ./Arwiland-Linux-amd64.deb`).
+            - 🪟 **Windows (10 / 11)**: Unduh **`Arwiland-Windows-Setup.exe`**
+              *(Klik 2x -> Install. Otomatis membuat shortcut, Auto-Start saat Windows menyala, dan langsung menempel di atas layar).*
+            - 🍎 **macOS (Apple Silicon & Intel)**: Unduh **`Arwiland-macOS.dmg`**
+              *(Buka `.dmg` dan tarik `Arwiland.app` ke folder `Applications`).*
+            - 🐧 **Linux (Ubuntu / Debian / Mint)**: Unduh **`Arwiland-Linux-amd64.deb`**
+              *(Klik 2x atau `sudo apt install ./Arwiland-Linux-amd64.deb`).*
+            - 🎩 **Linux (Fedora / RHEL / CentOS / openSUSE)**: Unduh **`Arwiland-Linux-x86_64.rpm`**
+              *(Klik 2x atau `sudo dnf install ./Arwiland-Linux-x86_64.rpm`).*
           draft: false
-          prerelease: false
+          prerelease: true
           files: |
             release-assets/Arwiland-Windows-Setup.exe
             release-assets/Arwiland-macOS.dmg
             release-assets/Arwiland-Linux-amd64.deb
+            release-assets/Arwiland-Linux-x86_64.rpm

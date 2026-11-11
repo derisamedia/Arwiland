@@ -8,11 +8,12 @@
 
 Kamu **tidak perlu** menginstal MSYS2, Homebrew, ataupun Rust. Cukup unduh file installer siap pakai dari halaman **[Releases](https://github.com/derisamedia/Arwiland/releases/latest)** (atau tab **[Actions](https://github.com/derisamedia/Arwiland/actions)**):
 
-| Sistem Operasi | File Installer | Cara Pasang |
+| Sistem Operasi | File Installer Native (`v0.0.1`) | Cara Pasang |
 | :--- | :--- | :--- |
-| 🪟 **Windows 10 / 11** | **[`Arwiland-Windows-Setup.exe`](https://github.com/derisamedia/Arwiland/releases/latest)** | 1. Klik 2x **`Arwiland-Windows-Setup.exe`**.<br>2. Klik **Next -> Install**.<br>3. Otomatis membuat shortcut di Desktop/Start Menu, **otomatis berjalan saat Windows dinyalakan (Auto-Start)**, dan langsung menempel di bagian atas layar! |
-| 🍎 **macOS** | **[`Arwiland-macOS.dmg`](https://github.com/derisamedia/Arwiland/releases/latest)** | 1. Buka file **`Arwiland-macOS.dmg`**.<br>2. Tarik (**Drag & Drop**) ikon **`Arwiland.app`** ke folder **`Applications`**.<br>3. Buka **Arwiland** dari Launchpad / Applications. |
-| 🐧 **Linux (Ubuntu / Debian / Mint)** | **[`Arwiland-Linux-amd64.deb`](https://github.com/derisamedia/Arwiland/releases/latest)** | Klik 2x file `.deb` atau jalankan di terminal:<br>`sudo apt install ./Arwiland-Linux-amd64.deb` |
+| 🪟 **Windows 10 / 11** | **[`Arwiland-Windows-Setup.exe`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | 1. Klik 2x **`Arwiland-Windows-Setup.exe`**.<br>2. Klik **Next -> Install**.<br>3. Otomatis membuat shortcut di Desktop/Start Menu, **otomatis berjalan saat Windows dinyalakan (Auto-Start)**, dan langsung menempel di bagian atas layar! |
+| 🍎 **macOS** | **[`Arwiland-macOS.dmg`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | 1. Buka file **`Arwiland-macOS.dmg`**.<br>2. Tarik (**Drag & Drop**) ikon **`Arwiland.app`** ke folder **`Applications`**.<br>3. Buka **Arwiland** dari Launchpad / Applications. |
+| 🐧 **Linux (Ubuntu / Debian / Mint)** | **[`Arwiland-Linux-amd64.deb`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | Klik 2x file `.deb` atau jalankan di terminal:<br>`sudo apt install ./Arwiland-Linux-amd64.deb` |
+| 🎩 **Linux (Fedora / RHEL / openSUSE)** | **[`Arwiland-Linux-x86_64.rpm`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | Klik 2x file `.rpm` atau jalankan di terminal:<br>`sudo dnf install ./Arwiland-Linux-x86_64.rpm` |
 
 ---
 

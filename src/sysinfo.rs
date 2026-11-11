@@ -116,17 +116,16 @@ fn apply_platform_mute_toggle() {
 
 #[cfg(target_os = "windows")]
 fn apply_platform_mute_toggle() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let _ = Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(New-Object -ComObject WScript.Shell).SendKeys([char]173)",
-        ])
-        .status();
+    #[link(name = "user32")]
+    extern "system" {
+        fn keybd_event(bVk: u8, bScan: u8, dwFlags: u32, dwExtraInfo: usize);
+    }
+    const VK_VOLUME_MUTE: u8 = 0xAD;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    unsafe {
+        keybd_event(VK_VOLUME_MUTE, 0, 0, 0);
+        keybd_event(VK_VOLUME_MUTE, 0, KEYEVENTF_KEYUP, 0);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
