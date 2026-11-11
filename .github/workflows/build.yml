@@ -61,16 +61,16 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup MSYS2 & GTK4
+      - name: Setup MSYS2 (UCRT64) & GTK4
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-gtk4
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-rust
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-rust
       - name: Build Windows Release (.exe)
         run: cargo build --release
       - name: Upload Windows Artifact
