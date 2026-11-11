@@ -1,6 +1,18 @@
-# 🏝️ Arwiland — Cross-Platform Dynamic Island & Living Notch (Linux, Windows, macOS)
+# 🏝️ Arwiland — Cross-Platform Dynamic Island & Living Notch (Windows, macOS, Linux)
 
-**Arwiland** adalah aplikasi *Dynamic Island & Living Notch* ringan dan cepat yang dibangun menggunakan **Rust** dan **GTK4**. Mendukung **Linux**, **Windows**, dan **macOS**.
+**Arwiland** adalah aplikasi *Dynamic Island & Living Notch* ringan dan cepat yang dibangun menggunakan **Rust** dan **GTK4**. Mendukung **Windows (10/11)**, **macOS**, dan **Linux**.
+
+---
+
+## 📥 Download & Instalasi Langsung (Tanpa Perlu MSYS2 / Homebrew / Rust)
+
+Kamu **tidak perlu** menginstal MSYS2, Homebrew, ataupun Rust. Cukup unduh file installer siap pakai dari halaman **[Releases](https://github.com/derisamedia/Arwiland/releases/latest)** (atau tab **[Actions](https://github.com/derisamedia/Arwiland/actions)**):
+
+| Sistem Operasi | File Installer | Cara Pasang |
+| :--- | :--- | :--- |
+| 🪟 **Windows 10 / 11** | **[`Arwiland-Windows-Setup.exe`](https://github.com/derisamedia/Arwiland/releases/latest)** | 1. Klik 2x **`Arwiland-Windows-Setup.exe`**.<br>2. Klik **Next -> Install**.<br>3. Otomatis membuat shortcut di Desktop/Start Menu, **otomatis berjalan saat Windows dinyalakan (Auto-Start)**, dan langsung menempel di bagian atas layar! |
+| 🍎 **macOS** | **[`Arwiland-macOS.dmg`](https://github.com/derisamedia/Arwiland/releases/latest)** | 1. Buka file **`Arwiland-macOS.dmg`**.<br>2. Tarik (**Drag & Drop**) ikon **`Arwiland.app`** ke folder **`Applications`**.<br>3. Buka **Arwiland** dari Launchpad / Applications. |
+| 🐧 **Linux (Ubuntu / Debian / Mint)** | **[`Arwiland-Linux-amd64.deb`](https://github.com/derisamedia/Arwiland/releases/latest)** | Klik 2x file `.deb` atau jalankan di terminal:<br>`sudo apt install ./Arwiland-Linux-amd64.deb` |
 
 ---
 
@@ -30,84 +42,18 @@
 
 ---
 
-## 📦 Cara Instalasi
+## 🛠️ Build Manual dari Source Code (Opsional / Untuk Developer)
 
-### Opsi A: Download Langsung (Tanpa Compile)
-1. Buka tab **[Actions](https://github.com/derisamedia/Arwiland/actions)** di repositori GitHub ini.
-2. Klik build terbaru yang berwarna hijau (**Cross-Platform Build**).
-3. Gulir ke bagian **Artifacts** di bagian bawah halaman, lalu unduh sesuai sistem operasi kamu:
-   - 🐧 **Linux**: `Arwiland-Linux-x86_64`
-   - 🪟 **Windows**: `Arwiland-Windows-x86_64` (`arwiland.exe`)
-   - 🍎 **macOS**: `Arwiland-macOS`
+Jika kamu ingin memodifikasi kode sumber atau melakukan build sendiri:
 
----
-
-### Opsi B: Instalasi dari Source Code
-
-#### 🐧 1. Linux (Ubuntu / Debian / Fedora / Arch)
-
-**a. Pasang Dependency GTK4 & Rust:**
-- **Ubuntu / Debian / Linux Mint:**
-  ```bash
-  sudo apt update
-  sudo apt install -y git curl build-essential pkg-config libgtk-4-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libx11-dev
-  ```
-- **Fedora / RHEL:**
-  ```bash
-  sudo dnf install -y git curl gcc pkgconf-pkg-config gtk4-devel cairo-devel pango-devel gdk-pixbuf2-devel glib2-devel libX11-devel
-  ```
-- **Arch Linux / Manjaro:**
-  ```bash
-  sudo pacman -S --needed git curl base-devel gtk4 cairo pango gdk-pixbuf2 glib2 libx11
-  ```
-
-*(Jika belum menginstal Rust, jalankan: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)*
-
-**b. Clone & Install Otomatis (1 Perintah):**
 ```bash
 git clone https://github.com/derisamedia/Arwiland.git
 cd Arwiland
+
+# Untuk Linux (otomatis compile, pasang ke menu aplikasi & autostart):
 chmod +x install.sh run.sh uninstall.sh
 ./install.sh
 ```
-> Script `./install.sh` akan otomatis meng-compile versi rilis, memasang ikon aplikasi ke menu desktop Linux kamu, mengaktifkan fitur *Auto-Start*, dan langsung menjalankan **Arwiland**.
-
-**Cara Uninstall di Linux:**
-```bash
-./uninstall.sh
-```
-
----
-
-#### 🪟 2. Windows (10 / 11)
-
-1. Unduh dan instal **[MSYS2](https://www.msys2.org/)**.
-2. Buka terminal **MSYS2 UCRT64**, lalu instal paket GTK4 dan Rust:
-   ```bash
-   pacman -S --needed git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-rust
-   ```
-3. Clone dan jalankan **Arwiland**:
-   ```bash
-   git clone https://github.com/derisamedia/Arwiland.git
-   cd Arwiland
-   cargo run --release
-   ```
-   File executable siap pakai akan tersedia di `target/release/arwiland.exe`.
-
----
-
-#### 🍎 3. macOS (Apple Silicon & Intel)
-
-1. Pastikan **[Homebrew](https://brew.sh/)** sudah terpasang, lalu instal GTK4 dan Rust:
-   ```bash
-   brew install git rust gtk4 pkg-config cairo pango gdk-pixbuf glib
-   ```
-2. Clone dan jalankan **Arwiland**:
-   ```bash
-   git clone https://github.com/derisamedia/Arwiland.git
-   cd Arwiland
-   cargo run --release
-   ```
 
 ---
 

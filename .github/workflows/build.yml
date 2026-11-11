@@ -1,4 +1,4 @@
-name: Cross-Platform Build (Linux, Windows, macOS)
+name: Cross-Platform Installer Build (Linux .deb, Windows Setup.exe, macOS .dmg)
 
 on:
   push:
@@ -8,9 +8,15 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  # ===========================================================================
+  # 1. LINUX BUILD (.deb Installer + Portable .tar.gz)
+  # ===========================================================================
   build-linux:
-    name: Build Linux (x86_64)
+    name: Build Linux (.deb Installer)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,46 +28,68 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build Release Binary
         run: cargo build --release
-      - name: Upload Linux Artifact
+      - name: Package Debian/Ubuntu Installer (.deb)
+        run: |
+          mkdir -p pkg-deb/DEBIAN
+          mkdir -p pkg-deb/usr/bin
+          mkdir -p pkg-deb/usr/share/applications
+          mkdir -p pkg-deb/usr/share/icons/hicolor/scalable/apps
+          mkdir -p pkg-deb/etc/xdg/autostart
+
+          cp target/release/arwiland pkg-deb/usr/bin/arwiland
+          chmod 755 pkg-deb/usr/bin/arwiland
+          cp assets/arwiland.svg pkg-deb/usr/share/icons/hicolor/scalable/apps/arwiland.svg
+
+          cat << 'EOF' > pkg-deb/usr/share/applications/arwiland.desktop
+          [Desktop Entry]
+          Type=Application
+          Version=1.0
+          Name=Arwiland
+          GenericName=Dynamic Island & Living Notch
+          Comment=Dynamic Island & Living Notch
+          Exec=env GDK_BACKEND=x11 GSK_RENDERER=cairo /usr/bin/arwiland
+          Icon=arwiland
+          Terminal=false
+          Categories=Utility;GTK;
+          StartupNotify=false
+          EOF
+
+          cp pkg-deb/usr/share/applications/arwiland.desktop pkg-deb/etc/xdg/autostart/arwiland.desktop
+
+          cat << 'EOF' > pkg-deb/DEBIAN/control
+          Package: arwiland
+          Version: 0.1.0
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-4-1, libcairo2, libpango-1.0-0, libgdk-pixbuf-2.0-0, libglib2.0-0, libx11-6, curl
+          Maintainer: Arwiyah <yuimizuno86@gmail.com>
+          Description: Arwiland - Dynamic Island & Living Notch
+           Native Dynamic Island & Living Notch with Media Player, Word-Synced Lyrics,
+           Notifications, Pomodoro, To-Do, File Shelf, and Prayer Times.
+          EOF
+
+          dpkg-deb --build pkg-deb Arwiland-Linux-amd64.deb
+      - name: Upload Linux Installer Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Arwiland-Linux-x86_64
+          name: Arwiland-Linux-Installer-deb
           path: |
+            Arwiland-Linux-amd64.deb
             target/release/arwiland
-            assets/
-            install.sh
-            run.sh
-            README.md
 
-  build-macos:
-    name: Build macOS (Apple Silicon / Universal)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install GTK4 via Homebrew
-        run: brew install gtk4 pkg-config cairo pango gdk-pixbuf glib
-      - name: Install Rust Stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Build Release Binary
-        run: cargo build --release
-      - name: Upload macOS Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Arwiland-macOS
-          path: |
-            target/release/arwiland
-            assets/
-            README.md
-
+  # ===========================================================================
+  # 2. WINDOWS BUILD (Standalone Setup.exe Installer with Bundled GTK4 + Icons)
+  # ===========================================================================
   build-windows:
-    name: Build Windows (x86_64 .exe)
+    name: Build Windows Installer (Setup.exe)
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup MSYS2 (UCRT64) & GTK4
+      - name: Setup MSYS2 (UCRT64), GTK4 & NSIS Installer Builder
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -69,15 +97,198 @@ jobs:
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-nsis
       - name: Build Windows Release (.exe)
         run: cargo build --release
-      - name: Upload Windows Artifact
+      - name: Bundle Standalone Runtime (DLLs, Icons, Schemas) & Build Setup.exe
+        run: |
+          mkdir -p win-bundle/bin
+          mkdir -p win-bundle/share/glib-2.0/schemas
+          mkdir -p win-bundle/share/icons
+          mkdir -p win-bundle/lib
+
+          cp target/release/arwiland.exe win-bundle/bin/arwiland.exe
+
+          # Copy all required UCRT64 DLLs automatically
+          ldd target/release/arwiland.exe | awk '/\/ucrt64\/bin\// {print $3}' | xargs -I{} cp -f "{}" win-bundle/bin/
+          cp -f /ucrt64/bin/gdbus.exe win-bundle/bin/ 2>/dev/null || true
+
+          # Copy GSettings schemas & Adwaita symbolic icons so UI icons work out-of-the-box
+          cp -f /ucrt64/share/glib-2.0/schemas/gschemas.compiled win-bundle/share/glib-2.0/schemas/
+          cp -rf /ucrt64/share/icons/Adwaita win-bundle/share/icons/ 2>/dev/null || true
+          cp -rf /ucrt64/share/icons/hicolor win-bundle/share/icons/ 2>/dev/null || true
+          cp -rf /ucrt64/lib/gdk-pixbuf-2.0 win-bundle/lib/ 2>/dev/null || true
+
+          cat << 'EOF' > installer.nsi
+          !include "MUI2.nsh"
+          Name "Arwiland"
+          OutFile "Arwiland-Windows-Setup.exe"
+          InstallDir "$LOCALAPPDATA\Programs\Arwiland"
+          RequestExecutionLevel user
+
+          !define MUI_ABORTWARNING
+          !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\arwiland.exe"
+          !define MUI_FINISHPAGE_RUN_TEXT "Jalankan Arwiland sekarang"
+
+          !insertmacro MUI_PAGE_WELCOME
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
+
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "Indonesian"
+          !insertmacro MUI_LANGUAGE "English"
+
+          Section "Install"
+            SetOutPath "$INSTDIR"
+            File /r "win-bundle\*.*"
+
+            CreateDirectory "$SMPROGRAMS\Arwiland"
+            CreateShortCut "$SMPROGRAMS\Arwiland\Arwiland.lnk" "$INSTDIR\bin\arwiland.exe"
+            CreateShortCut "$DESKTOP\Arwiland.lnk" "$INSTDIR\bin\arwiland.exe"
+
+            ; Auto-run on Windows Startup ("langsung nempel" saat laptop nyala)
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Arwiland" '"$INSTDIR\bin\arwiland.exe"'
+
+            ; Register Uninstaller in Windows Installed Apps
+            WriteUninstaller "$INSTDIR\Uninstall.exe"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayName" "Arwiland - Dynamic Island & Living Notch"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayIcon" "$INSTDIR\bin\arwiland.exe"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "Publisher" "Arwiyah"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayVersion" "0.1.0"
+          SectionEnd
+
+          Section "Uninstall"
+            ExecWait 'taskkill /F /IM arwiland.exe'
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Arwiland"
+            DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland"
+            Delete "$DESKTOP\Arwiland.lnk"
+            RMDir /r "$SMPROGRAMS\Arwiland"
+            RMDir /r "$INSTDIR"
+          SectionEnd
+          EOF
+
+          makensis installer.nsi
+      - name: Upload Windows Setup.exe Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Arwiland-Windows-x86_64
-          path: |
-            target/release/arwiland.exe
-            assets/
-            README.md
+          name: Arwiland-Windows-Installer-exe
+          path: Arwiland-Windows-Setup.exe
+
+  # ===========================================================================
+  # 3. MACOS BUILD (Standalone Arwiland.app inside Arwiland-macOS.dmg)
+  # ===========================================================================
+  build-macos:
+    name: Build macOS Installer (.dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4 & dylibbundler via Homebrew
+        run: brew install gtk4 adwaita-icon-theme pkg-config cairo pango gdk-pixbuf glib dylibbundler
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build Release Binary
+        run: cargo build --release
+      - name: Bundle Standalone Arwiland.app & Package .dmg
+        run: |
+          APP_DIR="dmg-staging/Arwiland.app/Contents"
+          mkdir -p "$APP_DIR/MacOS"
+          mkdir -p "$APP_DIR/Frameworks"
+          mkdir -p "$APP_DIR/Resources/share/glib-2.0/schemas"
+          mkdir -p "$APP_DIR/Resources/share/icons"
+
+          cp target/release/arwiland "$APP_DIR/MacOS/arwiland-bin"
+          chmod +x "$APP_DIR/MacOS/arwiland-bin"
+
+          # Bundle Homebrew dylibs inside Arwiland.app so Mac users don't need Homebrew
+          dylibbundler -od -b \
+            -x "$APP_DIR/MacOS/arwiland-bin" \
+            -d "$APP_DIR/Frameworks/" \
+            -p "@executable_path/../Frameworks/"
+
+          BREW_PREFIX="$(brew --prefix)"
+          cp -f "$BREW_PREFIX/share/glib-2.0/schemas/gschemas.compiled" "$APP_DIR/Resources/share/glib-2.0/schemas/" || true
+          cp -rf "$BREW_PREFIX/share/icons/Adwaita" "$APP_DIR/Resources/share/icons/" || true
+          cp -rf "$BREW_PREFIX/share/icons/hicolor" "$APP_DIR/Resources/share/icons/" || true
+
+          cat << 'EOF' > "$APP_DIR/MacOS/Arwiland"
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          RES="$DIR/../Resources"
+          export XDG_DATA_DIRS="$RES/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          export GSETTINGS_SCHEMA_DIR="$RES/share/glib-2.0/schemas"
+          export GSK_RENDERER=cairo
+          exec "$DIR/arwiland-bin" "$@"
+          EOF
+          chmod +x "$APP_DIR/MacOS/Arwiland"
+
+          cat << 'EOF' > "$APP_DIR/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>Arwiland</string>
+              <key>CFBundleIdentifier</key>
+              <string>id.arwiland.DynamicIsland</string>
+              <key>CFBundleName</key>
+              <string>Arwiland</string>
+              <key>CFBundleVersion</key>
+              <string>0.1.0</string>
+              <key>CFBundleShortVersionString</key>
+              <string>0.1.0</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSUIElement</key>
+              <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Arwiland Installer" -srcfolder dmg-staging -ov -format UDZO Arwiland-macOS.dmg
+      - name: Upload macOS .dmg Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Arwiland-macOS-Installer-dmg
+          path: Arwiland-macOS.dmg
+
+  # ===========================================================================
+  # 4. PUBLISH AUTOMATIC GITHUB RELEASE (Downloadable on GitHub Releases Page)
+  # ===========================================================================
+  publish-release:
+    name: Publish Installers to GitHub Releases
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    steps:
+      - name: Download All Built Installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create or Update Latest GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: "Arwiland v0.1.0 — Cross-Platform Installer (Windows, macOS, Linux)"
+          body: |
+            ## 🏝️ Download Installer Siap Pakai (Tanpa Perlu Install MSYS2 / Homebrew / Rust)
+            Pilih sesuai sistem operasi kamu, klik dua kali untuk install, dan **Arwiland** langsung terpasang di atas layar & berjalan otomatis saat perangkat dinyalakan:
+
+            - 🪟 **Windows (10/11)**: Unduh **`Arwiland-Windows-Setup.exe`** (Installer lengkap dengan GTK4 runtime, shortcut Desktop/Start Menu, dan Auto-Start).
+            - 🍎 **macOS (Apple Silicon & Intel)**: Unduh **`Arwiland-macOS.dmg`** (Buka dan tarik `Arwiland.app` ke folder `Applications`).
+            - 🐧 **Linux (Ubuntu / Debian / Mint)**: Unduh **`Arwiland-Linux-amd64.deb`** (Klik 2x untuk install atau `sudo apt install ./Arwiland-Linux-amd64.deb`).
+          draft: false
+          prerelease: false
+          files: |
+            release-assets/Arwiland-Windows-Setup.exe
+            release-assets/Arwiland-macOS.dmg
+            release-assets/Arwiland-Linux-amd64.deb
