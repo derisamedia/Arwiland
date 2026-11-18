@@ -118,10 +118,15 @@ pub struct RuntimeContext {
     pub pomo_break_mode: bool,
     pub pomo_remaining_secs: u32,
     pub pomo_total_secs: u32,
+    pub alarm_ringing: bool,
+    pub alarm_ring_remaining_secs: u32,
+    pub last_triggered_alarm_key: String,
     pub last_art_path: Option<String>,
     pub cached_media: MediaStatus,
     pub last_seen_seq: u64,
     pub interp_pos_sec: f64,
+    pub media_seek_dragging: bool,
+    pub last_media_seek_at: Option<Instant>,
     pub cur_lyric: String,
     pub prev_lyric: String,
     pub prev_prev_lyric: String,
@@ -172,6 +177,7 @@ impl RuntimeContext {
         let cw = app_state.compact_width.clamp(250, 420) as f64;
         let accent = provider_accent(&app_state.lyric_provider);
         let unread = app_state.notifications.iter().filter(|n| !n.read).count();
+        let focus_secs = app_state.pomo_focus_mins.clamp(1, 180) * 60;
         Self {
             app_state,
             expanded: false,
@@ -188,12 +194,17 @@ impl RuntimeContext {
             last_input_h: 0,
             pomo_running: false,
             pomo_break_mode: false,
-            pomo_remaining_secs: 25 * 60,
-            pomo_total_secs: 25 * 60,
+            pomo_remaining_secs: focus_secs,
+            pomo_total_secs: focus_secs,
+            alarm_ringing: false,
+            alarm_ring_remaining_secs: 0,
+            last_triggered_alarm_key: String::new(),
             last_art_path: None,
             cached_media: MediaStatus::default(),
             last_seen_seq: 0,
             interp_pos_sec: 0.0,
+            media_seek_dragging: false,
+            last_media_seek_at: None,
             cur_lyric: String::new(),
             prev_lyric: String::new(),
             prev_prev_lyric: String::new(),
@@ -269,7 +280,7 @@ impl RuntimeContext {
                     (150.0 + (n.min(4) as f64) * 38.0).clamp(188.0, 298.0)
                 }
             }
-            "prayer" => 216.0,
+            "prayer" => 248.0,
             _ => EXPANDED_H,
         }
     }

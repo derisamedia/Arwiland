@@ -4,6 +4,7 @@ use std::process::Command;
 #[derive(Clone, Debug, Default)]
 pub struct MediaStatus {
     pub active_bus: Option<String>,
+    pub track_id: Option<String>,
     pub has_player: bool,
     pub player_name: String,
     pub title: String,
@@ -82,6 +83,9 @@ fn extract_gvariant_str(raw: &str, key: &str) -> Option<String> {
     // If array of strings like ['SlowBass Nation'] or ["Artist"]
     if inner.starts_with('[') {
         inner = inner[1..].trim_start();
+    }
+    if let Some(rest) = inner.strip_prefix("objectpath") {
+        inner = rest.trim_start();
     }
 
     let quote = inner.chars().next()?;
@@ -187,9 +191,11 @@ pub fn query_media_status() -> MediaStatus {
             let len_us = extract_gvariant_i64(&raw, "mpris:length")
                 .unwrap_or(0)
                 .max(0) as u64;
+            let track_id = extract_gvariant_str(&raw, "mpris:trackid");
 
             let status = MediaStatus {
                 active_bus: Some(bus),
+                track_id,
                 has_player: true,
                 player_name,
                 title,
@@ -243,6 +249,7 @@ pub fn query_media_status() -> MediaStatus {
                 let len_f = parts[5].replace(',', ".").parse::<f64>().unwrap_or(0.0);
                 return MediaStatus {
                     active_bus: Some(parts[0].to_string()),
+                    track_id: None,
                     has_player: true,
                     player_name: parts[0].to_string(),
                     title: parts[2].to_string(),
@@ -259,6 +266,7 @@ pub fn query_media_status() -> MediaStatus {
 
     MediaStatus {
         active_bus: None,
+        track_id: None,
         has_player: false,
         player_name: "Tidak ada pemutar".to_string(),
         title: "Tidak ada media diputar".to_string(),
@@ -268,6 +276,158 @@ pub fn query_media_status() -> MediaStatus {
         position_secs: 0,
         position_f64: 0.0,
         length_secs: 0,
+    }
+}
+
+pub fn seek_media_to(
+    cached_bus: Option<&str>,
+    cached_track_id: Option<&str>,
+    target_secs: f64,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let target_us = (target_secs.max(0.0) * 1_000_000.0).round() as i64;
+
+        let call_set_position = |bus: &str, tid: &str| -> bool {
+            if let Ok(out) = Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--print-reply",
+                    "--reply-timeout=1000",
+                    &format!("--dest={}", bus),
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player.SetPosition",
+                    &format!("objpath:{}", tid),
+                    &format!("int64:{}", target_us),
+                ])
+                .output()
+            {
+                if out.status.success() {
+                    return true;
+                }
+            }
+            if let Ok(out) = Command::new("gdbus")
+                .args([
+                    "call",
+                    "--session",
+                    "--timeout",
+                    "1",
+                    "--dest",
+                    bus,
+                    "--object-path",
+                    "/org/mpris/MediaPlayer2",
+                    "--method",
+                    "org.mpris.MediaPlayer2.Player.SetPosition",
+                    &format!("objectpath '{}'", tid),
+                    &format!("int64 {}", target_us),
+                ])
+                .output()
+            {
+                if out.status.success() {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Fast path: use cached bus & track_id (defaulting to NoTrack for Chromium/Chrome)
+        if let Some(bus) = cached_bus {
+            let default_tid = if bus.to_lowercase().contains("firefox") {
+                "/org/mpris/MediaPlayer2/firefox"
+            } else {
+                "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+            };
+            let tid = cached_track_id
+                .filter(|t| t.starts_with('/'))
+                .unwrap_or(default_tid);
+            if call_set_position(bus, tid) {
+                return true;
+            }
+        }
+
+        // Fallback: query fresh status for bus / track_id / current position
+        let status = query_media_status();
+        let Some(bus) = status
+            .active_bus
+            .or_else(|| cached_bus.map(|s| s.to_string()))
+            .or_else(|| find_all_mpris_buses().into_iter().next())
+        else {
+            return false;
+        };
+
+        let default_tid = if bus.to_lowercase().contains("firefox") {
+            "/org/mpris/MediaPlayer2/firefox"
+        } else {
+            "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+        };
+        let tid = status
+            .track_id
+            .as_deref()
+            .or(cached_track_id)
+            .filter(|t| t.starts_with('/'))
+            .unwrap_or(default_tid);
+
+        if call_set_position(&bus, tid) {
+            return true;
+        }
+
+        let cur_us = (status.position_f64.max(0.0) * 1_000_000.0).round() as i64;
+        let offset_us = target_us - cur_us;
+        if let Ok(out) = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--reply-timeout=1000",
+                &format!("--dest={}", bus),
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player.Seek",
+                &format!("int64:{}", offset_us),
+            ])
+            .output()
+        {
+            if out.status.success() {
+                return true;
+            }
+        }
+        if let Ok(out) = Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--timeout",
+                "1",
+                "--dest",
+                &bus,
+                "--object-path",
+                "/org/mpris/MediaPlayer2",
+                "--method",
+                "org.mpris.MediaPlayer2.Player.Seek",
+                &format!("int64 {}", offset_us),
+            ])
+            .output()
+        {
+            return out.status.success();
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (cached_bus, cached_track_id);
+        let cmd = format!(
+            "tell application \"Spotify\" to set player position to {:.2}",
+            target_secs.max(0.0)
+        );
+        Command::new("osascript")
+            .args(["-e", &cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (cached_bus, cached_track_id, target_secs);
+        false
     }
 }
 

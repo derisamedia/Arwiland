@@ -30,7 +30,7 @@ Kamu **tidak perlu** menginstal MSYS2, Homebrew, ataupun Rust. Cukup unduh file 
    - Dilengkapi **Live Audio Spectrum Visualizer**, kontrol `Prev`, `Play/Pause`, `Next`, **Interactive Volume HUD** (bisa di-*scroll* atau digeser langsung di Notch), serta **Live Synchronized Lyrics** (mendukung LRCLIB, NetEase, KuGou KRC per-kata, Musixmatch RichSync, dan YouTube Auto-Captions).
 
 3. **⏱️ Fokus & Produktivitas (Pomodoro + Hidrasi + To-Do List)**
-   - **Pomodoro Timer**: Mode Fokus (25 menit) & Istirahat Pendek (5 menit) lengkap dengan penghitung sesi dan notifikasi otomatis.
+   - **Pomodoro Timer Kustom**: Durasi Fokus (`1–180 menit`, default `25 menit`) & Istirahat (`1–60 menit`, default `5 menit`) yang dapat diubah langsung melalui tombol cepat (`-5m`, `-1m`, `+1m`, `+5m`) di tab **Fokus** maupun melalui **Pengaturan**, lengkap dengan penghitung sesi dan notifikasi otomatis.
    - **Pengingat Hidrasi (Air Putih)**: Lacak target minum harian (`8 gelas / hari`).
    - **Daily To-Do List**: Tambah, centang, dan hapus tugas harian.
 
@@ -38,8 +38,8 @@ Kamu **tidak perlu** menginstal MSYS2, Homebrew, ataupun Rust. Cukup unduh file 
    - Tarik & lepas (*Drag & Drop*) file dari File Manager/Explorer/Finder langsung ke dalam tab **Shelf** atau gunakan tombol **Pilih**.
    - Buka file dengan cepat atau salin path file ke clipboard kapan saja.
 
-5. **🕌 Jadwal Sholat & Hitung Mundur**
-   - Perhitungan astronomis waktu sholat standar Kemenag RI (*Imsak, Subuh, Dzuhur, Ashar, Maghrib, Isya*) untuk berbagai kota di Indonesia (WIB, WITA, WIT) lengkap dengan hitung mundur (*countdown*).
+5. **🕌 Jadwal Sholat & Hitung Mundur (Kota & Kecamatan)**
+   - Perhitungan astronomis waktu sholat standar Kemenag RI (*Imsak, Subuh, Dzuhur, Ashar, Maghrib, Isya*) yang dapat diubah sesuai **Kota / Kabupaten / Kecamatan** di seluruh Indonesia (WIB, WITA, WIT) lengkap dengan fitur pencarian wilayah & hitung mundur (*countdown*).
 
 ---
 

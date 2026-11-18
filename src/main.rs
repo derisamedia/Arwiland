@@ -12,7 +12,7 @@ mod style;
 mod sysinfo;
 mod x11_helper;
 
-use chrono::Local;
+use chrono::{Local, Timelike};
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -20,13 +20,18 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lyrics::LyricsManager;
-use mpris::send_mpris_command;
+use mpris::{seek_media_to, send_mpris_command};
 use notifications::{set_system_notification_banners_hidden, NotificationHub};
-use prayer::{calculate_prayer_schedule, INDONESIAN_CITIES};
+use prayer::{
+    calculate_prayer_schedule_for_region, resolve_region_from_state, search_regions_local,
+    search_regions_online, PrayerRegion, INDONESIAN_CITIES,
+};
 use renderer::{
     draw_island_canvas, draw_media_card_lyrics_and_progress, draw_media_card_visualizer,
     draw_pango_layout_at, measure_unconstrained_text, measure_words_exact,
@@ -72,6 +77,53 @@ fn load_css() {
             gtk4::STYLE_PROVIDER_PRIORITY_USER + 200,
         );
     }
+}
+
+fn play_alarm_chime() {
+    thread::spawn(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let sound_path = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga";
+            if std::path::Path::new(sound_path).exists() {
+                if Command::new("paplay")
+                    .arg(sound_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                if Command::new("pw-play")
+                    .arg(sound_path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+            let _ = Command::new("canberra-gtk-play")
+                .args(["-i", "alarm-clock-elapsed"])
+                .status();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("afplay")
+                .arg("/System/Library/Sounds/Glass.aiff")
+                .status();
+        }
+    });
+}
+
+fn stop_alarm_chime() {
+    thread::spawn(|| {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("pkill")
+                .args(["-f", "alarm-clock-elapsed"])
+                .status();
+        }
+    });
 }
 
 fn build_ui(app: &gtk4::Application) {
@@ -456,7 +508,7 @@ fn build_ui(app: &gtk4::Application) {
     stack.add_named(&notif_page, Some("notif"));
 
     // =========================================================================
-    // PAGE 3: FOKUS (Pomodoro + Hidrasi)
+    // PAGE 3: FOKUS (Pomodoro + Alarm Pengingat)
     // =========================================================================
     let focus_page = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
 
@@ -482,9 +534,38 @@ fn build_ui(app: &gtk4::Application) {
     pomo_top.append(&pomo_tag);
     pomo_top.append(&pomo_sess_lbl);
 
-    let pomo_digits = gtk4::Label::new(Some("25:00"));
+    let pomo_digits = gtk4::Label::new(Some(&format!(
+        "{:02}:00",
+        ctx.borrow().app_state.pomo_focus_mins
+    )));
     pomo_digits.add_css_class("timer-display");
     pomo_digits.set_halign(gtk4::Align::Start);
+    pomo_digits.set_hexpand(true);
+
+    let pomo_timer_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    pomo_timer_row.set_valign(gtk4::Align::Center);
+
+    let btn_pomo_sub5 = gtk4::Button::with_label("-5m");
+    btn_pomo_sub5.add_css_class("pill-btn");
+    btn_pomo_sub5.set_tooltip_text(Some("Kurangi waktu 5 menit"));
+
+    let btn_pomo_sub1 = gtk4::Button::with_label("-1m");
+    btn_pomo_sub1.add_css_class("pill-btn");
+    btn_pomo_sub1.set_tooltip_text(Some("Kurangi waktu 1 menit"));
+
+    let btn_pomo_add1 = gtk4::Button::with_label("+1m");
+    btn_pomo_add1.add_css_class("pill-btn");
+    btn_pomo_add1.set_tooltip_text(Some("Tambah waktu 1 menit"));
+
+    let btn_pomo_add5 = gtk4::Button::with_label("+5m");
+    btn_pomo_add5.add_css_class("pill-btn");
+    btn_pomo_add5.set_tooltip_text(Some("Tambah waktu 5 menit"));
+
+    pomo_timer_row.append(&pomo_digits);
+    pomo_timer_row.append(&btn_pomo_sub5);
+    pomo_timer_row.append(&btn_pomo_sub1);
+    pomo_timer_row.append(&btn_pomo_add1);
+    pomo_timer_row.append(&btn_pomo_add5);
 
     let pomo_bar = gtk4::ProgressBar::new();
     pomo_bar.set_fraction(1.0);
@@ -492,7 +573,10 @@ fn build_ui(app: &gtk4::Application) {
     let pomo_btns = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     let btn_pomo_start = make_icon_pill_btn("media-playback-start-symbolic", "Mulai", true);
     let btn_pomo_reset = make_icon_pill_btn("view-refresh-symbolic", "Reset", false);
-    let btn_pomo_mode = gtk4::Button::with_label("Rehat 5m");
+    let btn_pomo_mode = gtk4::Button::with_label(&format!(
+        "Rehat {}m",
+        ctx.borrow().app_state.pomo_break_mins
+    ));
     btn_pomo_mode.add_css_class("pill-btn");
 
     pomo_btns.append(&btn_pomo_start);
@@ -500,49 +584,104 @@ fn build_ui(app: &gtk4::Application) {
     pomo_btns.append(&btn_pomo_mode);
 
     pomo_card.append(&pomo_top);
-    pomo_card.append(&pomo_digits);
+    pomo_card.append(&pomo_timer_row);
     pomo_card.append(&pomo_bar);
     pomo_card.append(&pomo_btns);
 
-    let water_card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    water_card.add_css_class("glass-card");
-    water_card.set_width_request(180);
+    let alarm_card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    alarm_card.add_css_class("glass-card");
+    alarm_card.set_hexpand(true);
 
-    let water_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    let water_icon = gtk4::Image::from_icon_name("weather-showers-symbolic");
-    water_icon.set_pixel_size(13);
-    water_icon.add_css_class("pill-icon");
-    let water_tag = gtk4::Label::new(Some("HIDRASI AIR"));
-    water_tag.add_css_class("tag-label");
-    water_top.append(&water_icon);
-    water_top.append(&water_tag);
+    let alarm_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let alarm_icon = gtk4::Image::from_icon_name("preferences-system-time-symbolic");
+    alarm_icon.set_pixel_size(13);
+    alarm_icon.add_css_class("pill-icon");
+    let alarm_tag = gtk4::Label::new(Some("ALARM PENGINGAT"));
+    alarm_tag.add_css_class("tag-label");
+    alarm_tag.set_hexpand(true);
+    alarm_tag.set_halign(gtk4::Align::Start);
 
-    let water_val_lbl = gtk4::Label::new(Some("2 / 8 Gelas"));
-    water_val_lbl.add_css_class("heading-label");
-    water_val_lbl.set_halign(gtk4::Align::Start);
-    water_val_lbl.set_vexpand(true);
+    let alarm_status_lbl = gtk4::Label::new(Some(if ctx.borrow().app_state.alarm_enabled {
+        "AKTIF"
+    } else {
+        "NONAKTIF"
+    }));
+    alarm_status_lbl.add_css_class("muted-label");
+    alarm_top.append(&alarm_icon);
+    alarm_top.append(&alarm_tag);
+    alarm_top.append(&alarm_status_lbl);
 
-    let water_prog = gtk4::ProgressBar::new();
+    let alarm_digits = gtk4::Label::new(Some(&format!(
+        "{:02}:{:02}",
+        ctx.borrow().app_state.alarm_hour.min(23),
+        ctx.borrow().app_state.alarm_min.min(59)
+    )));
+    alarm_digits.add_css_class("timer-display");
+    alarm_digits.set_halign(gtk4::Align::Start);
+    alarm_digits.set_hexpand(true);
 
-    let water_btns = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    let btn_water_add = make_icon_pill_btn("list-add-symbolic", "Gelas", true);
-    btn_water_add.set_hexpand(true);
-    let btn_water_reset = gtk4::Button::new();
-    let wr_img = gtk4::Image::from_icon_name("view-refresh-symbolic");
-    wr_img.set_pixel_size(13);
-    btn_water_reset.set_child(Some(&wr_img));
-    btn_water_reset.add_css_class("pill-btn");
+    let alarm_timer_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    alarm_timer_row.set_valign(gtk4::Align::Center);
 
-    water_btns.append(&btn_water_add);
-    water_btns.append(&btn_water_reset);
+    let btn_alarm_add_h = gtk4::Button::with_label("+1j");
+    btn_alarm_add_h.add_css_class("pill-btn");
+    btn_alarm_add_h.set_tooltip_text(Some("Tambah 1 jam"));
 
-    water_card.append(&water_top);
-    water_card.append(&water_val_lbl);
-    water_card.append(&water_prog);
-    water_card.append(&water_btns);
+    let btn_alarm_sub_m5 = gtk4::Button::with_label("-5m");
+    btn_alarm_sub_m5.add_css_class("pill-btn");
+    btn_alarm_sub_m5.set_tooltip_text(Some("Kurangi 5 menit"));
+
+    let btn_alarm_add_m1 = gtk4::Button::with_label("+1m");
+    btn_alarm_add_m1.add_css_class("pill-btn");
+    btn_alarm_add_m1.set_tooltip_text(Some("Tambah 1 menit"));
+
+    let btn_alarm_add_m5 = gtk4::Button::with_label("+5m");
+    btn_alarm_add_m5.add_css_class("pill-btn");
+    btn_alarm_add_m5.set_tooltip_text(Some("Tambah 5 menit"));
+
+    alarm_timer_row.append(&alarm_digits);
+    alarm_timer_row.append(&btn_alarm_add_h);
+    alarm_timer_row.append(&btn_alarm_sub_m5);
+    alarm_timer_row.append(&btn_alarm_add_m1);
+    alarm_timer_row.append(&btn_alarm_add_m5);
+
+    let alarm_bar = gtk4::ProgressBar::new();
+    alarm_bar.set_fraction(if ctx.borrow().app_state.alarm_enabled {
+        1.0
+    } else {
+        0.0
+    });
+
+    let alarm_btns = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let init_alarm_on = ctx.borrow().app_state.alarm_enabled;
+    let btn_alarm_toggle = make_icon_pill_btn(
+        if init_alarm_on {
+            "media-playback-stop-symbolic"
+        } else {
+            "alarm-symbolic"
+        },
+        if init_alarm_on { "Matikan" } else { "Aktifkan" },
+        true,
+    );
+    let btn_alarm_snooze = gtk4::Button::with_label("Tunda 5m");
+    btn_alarm_snooze.add_css_class("pill-btn");
+    btn_alarm_snooze.set_tooltip_text(Some("Setel alarm 5 menit dari waktu sekarang"));
+
+    let btn_alarm_sub_h = gtk4::Button::with_label("-1j");
+    btn_alarm_sub_h.add_css_class("pill-btn");
+    btn_alarm_sub_h.set_tooltip_text(Some("Kurangi 1 jam"));
+
+    alarm_btns.append(&btn_alarm_toggle);
+    alarm_btns.append(&btn_alarm_snooze);
+    alarm_btns.append(&btn_alarm_sub_h);
+
+    alarm_card.append(&alarm_top);
+    alarm_card.append(&alarm_timer_row);
+    alarm_card.append(&alarm_bar);
+    alarm_card.append(&alarm_btns);
 
     focus_page.append(&pomo_card);
-    focus_page.append(&water_card);
+    focus_page.append(&alarm_card);
     stack.add_named(&focus_page, Some("focus"));
 
     // =========================================================================
@@ -616,9 +755,9 @@ fn build_ui(app: &gtk4::Application) {
     stack.add_named(&shelf_page, Some("shelf"));
 
     // =========================================================================
-    // PAGE 6: SHOLAT (Jadwal Sholat & Hitung Mundur)
+    // PAGE 6: SHOLAT (Jadwal Sholat & Hitung Mundur + Pilih Kota/Kecamatan)
     // =========================================================================
-    let prayer_page = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    let prayer_page = gtk4::Box::new(gtk4::Orientation::Vertical, 7);
     prayer_page.add_css_class("glass-card");
 
     let prayer_head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -628,28 +767,65 @@ fn build_ui(app: &gtk4::Application) {
     let prayer_title_lbl = gtk4::Label::new(Some("JADWAL SHOLAT"));
     prayer_title_lbl.add_css_class("tag-label");
     prayer_title_lbl.set_halign(gtk4::Align::Start);
+    prayer_title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     let prayer_next_lbl = gtk4::Label::new(Some("Dzuhur pukul 11:42 (-04:55:00)"));
     prayer_next_lbl.add_css_class("heading-label");
     prayer_next_lbl.set_halign(gtk4::Align::Start);
+    prayer_next_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     prayer_info_vbox.append(&prayer_title_lbl);
     prayer_info_vbox.append(&prayer_next_lbl);
 
-    let city_names: Vec<&str> = INDONESIAN_CITIES.iter().map(|c| c.name).collect();
-    let city_dropdown = gtk4::DropDown::from_strings(&city_names);
-    let init_city_idx = INDONESIAN_CITIES
+    let init_prayer_region = {
+        let st = ctx.borrow();
+        resolve_region_from_state(
+            &st.app_state.selected_city,
+            st.app_state.prayer_lat,
+            st.app_state.prayer_lon,
+            st.app_state.prayer_tz_offset,
+            st.app_state.prayer_tz_label.as_deref(),
+        )
+    };
+    let active_region_options: Rc<RefCell<Vec<PrayerRegion>>> = Rc::new(RefCell::new({
+        let mut list = vec![init_prayer_region.clone()];
+        for c in INDONESIAN_CITIES {
+            if !list.iter().any(|r| r.name.eq_ignore_ascii_case(c.name)) {
+                list.push(c.to_region());
+            }
+        }
+        list
+    }));
+    let init_dd_labels: Vec<String> = active_region_options
+        .borrow()
         .iter()
-        .position(|c| {
-            c.name
-                .eq_ignore_ascii_case(&ctx.borrow().app_state.selected_city)
-        })
-        .unwrap_or(0) as u32;
-    city_dropdown.set_selected(init_city_idx);
+        .map(|r| format!("{} ({})", r.name, r.tz_label))
+        .collect();
+    let init_dd_refs: Vec<&str> = init_dd_labels.iter().map(|s| s.as_str()).collect();
+    let region_str_list = gtk4::StringList::new(&init_dd_refs);
+    let city_dropdown =
+        gtk4::DropDown::new(Some(region_str_list.clone()), gtk4::Expression::NONE);
+    city_dropdown.set_selected(0);
     city_dropdown.set_valign(gtk4::Align::Center);
 
     prayer_head.append(&prayer_info_vbox);
     prayer_head.append(&city_dropdown);
+
+    let prayer_search_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let prayer_search_entry = gtk4::Entry::new();
+    prayer_search_entry.set_placeholder_text(Some(
+        "Cari kota atau kecamatan (mis: Kebayoran Baru, Coblong, Gubeng)...",
+    ));
+    prayer_search_entry.add_css_class("island-entry");
+    prayer_search_entry.set_hexpand(true);
+
+    let btn_prayer_search = make_icon_pill_btn("system-search-symbolic", "Cari", true);
+    btn_prayer_search.set_tooltip_text(Some(
+        "Cari jadwal sholat sesuai Kota / Kabupaten / Kecamatan",
+    ));
+
+    prayer_search_row.append(&prayer_search_entry);
+    prayer_search_row.append(&btn_prayer_search);
 
     let sholat_strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     sholat_strip.set_homogeneous(true);
@@ -673,6 +849,7 @@ fn build_ui(app: &gtk4::Application) {
     }
 
     prayer_page.append(&prayer_head);
+    prayer_page.append(&prayer_search_row);
     prayer_page.append(&sholat_strip);
     stack.add_named(&prayer_page, Some("prayer"));
 
@@ -697,6 +874,9 @@ fn build_ui(app: &gtk4::Application) {
     let ext_provider_status_lbl = settings_handles.ext_provider_status_lbl;
     let btn_ext_test_notif = settings_handles.btn_ext_test_notif;
     let startup_chk = settings_handles.startup_chk;
+    let ext_pomo_focus_scale = settings_handles.pomo_focus_scale;
+    let ext_pomo_break_scale = settings_handles.pomo_break_scale;
+    let ext_prayer_badge_lbl = settings_handles.ext_prayer_badge_lbl;
 
     {
         let sw = settings_win.clone();
@@ -1000,6 +1180,10 @@ fn build_ui(app: &gtk4::Application) {
                     }
                 }
 
+                let recently_seeked = st
+                    .last_media_seek_at
+                    .map(|t| t.elapsed() < Duration::from_millis(1800))
+                    .unwrap_or(false);
                 let mut media_state_dirty = false;
                 if let Ok(guard) = bg_mon.try_lock() {
                     if guard.media_seq != st.last_seen_seq {
@@ -1008,10 +1192,12 @@ fn build_ui(app: &gtk4::Application) {
                         let track_changed = st.cached_media.title != new_m.title
                             || st.cached_media.artist != new_m.artist;
                         let play_state_changed = st.cached_media.playing != new_m.playing;
-                        if (st.interp_pos_sec - new_m.position_f64).abs() > 0.85
-                            || track_changed
-                            || play_state_changed
-                            || !new_m.playing
+                        if track_changed
+                            || (!st.media_seek_dragging
+                                && !recently_seeked
+                                && ((st.interp_pos_sec - new_m.position_f64).abs() > 0.85
+                                    || play_state_changed
+                                    || !new_m.playing))
                         {
                             st.interp_pos_sec = new_m.position_f64;
                         }
@@ -1192,10 +1378,19 @@ fn build_ui(app: &gtk4::Application) {
                     && (st.vol_osd_remaining > 0.0
                         || (st.active_notif_toast.is_some() && st.notif_toast_remaining > 0.0));
 
-                if is_playing {
-                    st.interp_pos_sec += dt;
-                    if !has_active_toast {
-                        st.wave_phase += dt * 5.8;
+                if is_playing
+                    || (st.cached_media.has_player && (st.media_seek_dragging || recently_seeked))
+                {
+                    if is_playing && !st.media_seek_dragging {
+                        let max_len = st.cached_media.length_secs as f64;
+                        if max_len > 0.5 {
+                            st.interp_pos_sec = (st.interp_pos_sec + dt).min(max_len);
+                        } else {
+                            st.interp_pos_sec += dt;
+                        }
+                        if !has_active_toast {
+                            st.wave_phase += dt * 5.8;
+                        }
                     }
                     redraw = true;
 
@@ -1772,11 +1967,11 @@ fn build_ui(app: &gtk4::Application) {
             let ctx_l = ctx_leave.clone();
             let set_l = set_exp_out.clone();
             glib::timeout_add_local_once(Duration::from_millis(360), move || {
-                let (hovered, pinned) = {
+                let (hovered, pinned, seeking) = {
                     let st = ctx_l.borrow();
-                    (st.is_hovered, st.app_state.pinned)
+                    (st.is_hovered, st.app_state.pinned, st.media_seek_dragging)
                 };
-                if !hovered && !pinned {
+                if !hovered && !pinned && !seeking {
                     set_l(false);
                 }
             });
@@ -1961,6 +2156,13 @@ fn build_ui(app: &gtk4::Application) {
             grab_keyboard_focus(&win_kb);
         });
         todo_entry.add_controller(focus_ctrl);
+
+        let prayer_focus_ctrl = gtk4::EventControllerFocus::new();
+        let win_kb2 = window.clone();
+        prayer_focus_ctrl.connect_enter(move |_| {
+            grab_keyboard_focus(&win_kb2);
+        });
+        prayer_search_entry.add_controller(prayer_focus_ctrl);
     }
 
     {
@@ -2052,6 +2254,227 @@ fn build_ui(app: &gtk4::Application) {
                 let _ = send_mpris_command("Next");
             });
         });
+
+        // Interactive Media Duration Progress Bar (Click & Drag to Seek)
+        let pending_seek: Arc<Mutex<Option<(Option<String>, Option<String>, f64)>>> =
+            Arc::new(Mutex::new(None));
+        let seek_worker_busy = Arc::new(AtomicBool::new(false));
+        let last_live_seek_at = Rc::new(RefCell::new(Instant::now() - Duration::from_secs(5)));
+
+        let dispatch_seek = {
+            let pending = pending_seek.clone();
+            let busy = seek_worker_busy.clone();
+            Rc::new(
+                move |bus: Option<String>, track_id: Option<String>, target_sec: f64| {
+                    if let Ok(mut guard) = pending.lock() {
+                        *guard = Some((bus, track_id, target_sec));
+                    }
+                    if busy
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        let p_bg = pending.clone();
+                        let b_bg = busy.clone();
+                        thread::spawn(move || loop {
+                            let next_job = p_bg.lock().ok().and_then(|mut g| g.take());
+                            if let Some((bus_opt, tid_opt, sec)) = next_job {
+                                let _ = seek_media_to(
+                                    bus_opt.as_deref(),
+                                    tid_opt.as_deref(),
+                                    sec,
+                                );
+                            } else {
+                                b_bg.store(false, Ordering::SeqCst);
+                                if p_bg.lock().map(|g| g.is_some()).unwrap_or(false)
+                                    && b_bg
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                        });
+                    }
+                },
+            )
+        };
+
+        let apply_media_seek_at_x = {
+            let ctx_ms = ctx.clone();
+            let canvas_ms = media_lyric_canvas.clone();
+            let bg_ms = bg_canvas.clone();
+            let l_mgr_ms = lyrics_mgr.clone();
+            let dispatch_ms = dispatch_seek.clone();
+            let last_live = last_live_seek_at.clone();
+
+            Rc::new(move |x_pos: f64, is_final: bool| {
+                let wf = (canvas_ms.width() as f64).max(80.0);
+                let track_x = 2.0;
+                let track_w = (wf - 4.0).max(40.0);
+                let frac = ((x_pos - track_x) / track_w).clamp(0.0, 1.0);
+
+                let maybe_seek = {
+                    let mut st = ctx_ms.borrow_mut();
+                    let len_sec = st.cached_media.length_secs as f64;
+                    if !st.cached_media.has_player || len_sec <= 0.5 {
+                        None
+                    } else {
+                        let target_sec = (frac * len_sec).clamp(0.0, len_sec);
+                        st.interp_pos_sec = target_sec;
+                        st.last_media_seek_at = Some(Instant::now());
+
+                        let prov_pref = st.app_state.lyric_provider.clone();
+                        let offset_ms = st.app_state.lyric_offset_ms;
+                        let snap = l_mgr_ms.get_lyric_snapshot(
+                            &st.cached_media.title,
+                            &st.cached_media.artist,
+                            st.interp_pos_sec,
+                            len_sec,
+                            &prov_pref,
+                            offset_ms,
+                        );
+                        st.lyric_line_prog = snap.line_progress;
+                        st.lyric_is_word_synced = snap.is_word_synced;
+                        st.active_word_idx = snap.active_word_idx;
+                        st.word_prog = snap.word_progress;
+                        st.lyric_accent_rgb = snap.accent_rgb;
+                        st.next_lyric = snap.next_line_text;
+                        if snap.current_text != st.cur_lyric {
+                            st.prev_prev_lyric = st.prev_lyric.clone();
+                            st.prev_lyric = snap.prev_line_text;
+                            st.cur_lyric = snap.current_text;
+                            st.lyric_words = snap.words;
+                            st.last_word_idx = 0;
+                            st.lyric_anim_prog = 1.0;
+                        }
+
+                        Some((
+                            st.cached_media.active_bus.clone(),
+                            st.cached_media.track_id.clone(),
+                            target_sec,
+                        ))
+                    }
+                };
+
+                if let Some((bus, tid, target_sec)) = maybe_seek {
+                    let should_send = if is_final {
+                        true
+                    } else {
+                        let mut last = last_live.borrow_mut();
+                        if last.elapsed() >= Duration::from_millis(140) {
+                            *last = Instant::now();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_send {
+                        dispatch_ms(bus, tid, target_sec);
+                    }
+                    canvas_ms.queue_draw();
+                    bg_ms.queue_draw();
+                }
+            })
+        };
+
+        let media_motion = gtk4::EventControllerMotion::new();
+        {
+            let ctx_mm = ctx.clone();
+            let canvas_mm = media_lyric_canvas.clone();
+            media_motion.connect_motion(move |_, _x, y| {
+                let can_seek = {
+                    let st = ctx_mm.borrow();
+                    st.cached_media.has_player && st.cached_media.length_secs > 0
+                };
+                if can_seek && (y <= 28.0 || ctx_mm.borrow().media_seek_dragging) {
+                    canvas_mm.set_cursor_from_name(Some("pointer"));
+                } else {
+                    canvas_mm.set_cursor_from_name(None);
+                }
+            });
+            let canvas_ml = media_lyric_canvas.clone();
+            media_motion.connect_leave(move |_| {
+                canvas_ml.set_cursor_from_name(None);
+            });
+        }
+        media_lyric_canvas.add_controller(media_motion);
+
+        let media_drag = gtk4::GestureDrag::new();
+        media_drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let m_drag_start_x = Rc::new(RefCell::new(0.0f64));
+        let m_drag_active = Rc::new(RefCell::new(false));
+
+        {
+            let ctx_db = ctx.clone();
+            let sx = m_drag_start_x.clone();
+            let act = m_drag_active.clone();
+            let apply_s = apply_media_seek_at_x.clone();
+            let last_live = last_live_seek_at.clone();
+            media_drag.connect_drag_begin(move |gesture, x, y| {
+                let can_start = {
+                    let mut st = ctx_db.borrow_mut();
+                    if y >= -4.0
+                        && y <= 30.0
+                        && st.cached_media.has_player
+                        && st.cached_media.length_secs > 0
+                    {
+                        st.media_seek_dragging = true;
+                        st.last_media_seek_at = Some(Instant::now());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                *act.borrow_mut() = can_start;
+                if can_start {
+                    *sx.borrow_mut() = x;
+                    *last_live.borrow_mut() = Instant::now();
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    apply_s(x, false);
+                }
+            });
+        }
+
+        {
+            let sx = m_drag_start_x.clone();
+            let act = m_drag_active.clone();
+            let apply_s = apply_media_seek_at_x.clone();
+            media_drag.connect_drag_update(move |_, off_x, _off_y| {
+                if *act.borrow() {
+                    let cur_x = *sx.borrow() + off_x;
+                    apply_s(cur_x, false);
+                }
+            });
+        }
+
+        {
+            let ctx_de = ctx.clone();
+            let sx = m_drag_start_x;
+            let act = m_drag_active;
+            let apply_s = apply_media_seek_at_x;
+            let canvas_de = media_lyric_canvas.clone();
+            media_drag.connect_drag_end(move |_, off_x, _off_y| {
+                if *act.borrow() {
+                    *act.borrow_mut() = false;
+                    {
+                        let mut st = ctx_de.borrow_mut();
+                        st.media_seek_dragging = false;
+                        st.last_media_seek_at = Some(Instant::now());
+                    }
+                    let final_x = *sx.borrow() + off_x;
+                    apply_s(final_x, true);
+                    canvas_de.queue_draw();
+                }
+            });
+        }
+
+        media_lyric_canvas.add_controller(media_drag);
     }
 
     // Pomodoro & Water Controls
@@ -2091,72 +2514,213 @@ fn build_ui(app: &gtk4::Application) {
         let tag_c = pomo_tag.clone();
         let dig_m = pomo_digits.clone();
         let bar_m = pomo_bar.clone();
+        let start_m = btn_pomo_start.clone();
         btn_pomo_mode.connect_clicked(move |b| {
             let mut st = ctx_pm.borrow_mut();
             st.pomo_running = false;
             st.pomo_break_mode = !st.pomo_break_mode;
             if st.pomo_break_mode {
-                st.pomo_total_secs = 5 * 60;
-                st.pomo_remaining_secs = 5 * 60;
+                let b_mins = st.app_state.pomo_break_mins.clamp(1, 60);
+                let f_mins = st.app_state.pomo_focus_mins.clamp(1, 180);
+                st.pomo_total_secs = b_mins * 60;
+                st.pomo_remaining_secs = b_mins * 60;
                 tag_c.set_label("ISTIRAHAT PENDEK");
-                b.set_label("Fokus 25m");
-                dig_m.set_label("05:00");
+                b.set_label(&format!("Fokus {}m", f_mins));
+                dig_m.set_label(&format!("{:02}:00", b_mins));
             } else {
-                st.pomo_total_secs = 25 * 60;
-                st.pomo_remaining_secs = 25 * 60;
+                let f_mins = st.app_state.pomo_focus_mins.clamp(1, 180);
+                let b_mins = st.app_state.pomo_break_mins.clamp(1, 60);
+                st.pomo_total_secs = f_mins * 60;
+                st.pomo_remaining_secs = f_mins * 60;
                 tag_c.set_label("POMODORO FOKUS");
-                b.set_label("Rehat 5m");
-                dig_m.set_label("25:00");
+                b.set_label(&format!("Rehat {}m", b_mins));
+                dig_m.set_label(&format!("{:02}:00", f_mins));
             }
             bar_m.set_fraction(1.0);
+            set_icon_pill_content(&start_m, "media-playback-start-symbolic", "Mulai");
         });
 
-        let sync_water = {
-            let ctx_w = ctx.clone();
-            let val_l = water_val_lbl.clone();
-            let prog_l = water_prog.clone();
-            move || {
-                let st = ctx_w.borrow();
-                let g = st.app_state.water_glasses;
-                let goal = st.app_state.water_goal.max(1);
-                val_l.set_label(&format!("{} / {} Gelas", g, goal));
-                prog_l.set_fraction((g as f64 / goal as f64).clamp(0.0, 1.0));
-            }
+        let adjust_pomo_mins: Rc<dyn Fn(i32)> = {
+            let ctx_adj = ctx.clone();
+            let dig_adj = pomo_digits.clone();
+            let bar_adj = pomo_bar.clone();
+            let mode_adj = btn_pomo_mode.clone();
+            let start_adj = btn_pomo_start.clone();
+            let pf_sc_adj = ext_pomo_focus_scale.clone();
+            let pb_sc_adj = ext_pomo_break_scale.clone();
+            Rc::new(move |delta: i32| {
+                let (new_mins, is_break, other_mins) = {
+                    let mut st = ctx_adj.borrow_mut();
+                    st.pomo_running = false;
+                    if st.pomo_break_mode {
+                        let cur = st.app_state.pomo_break_mins as i32;
+                        let next = if cur == 1 && delta == 5 {
+                            5
+                        } else {
+                            (cur + delta).clamp(1, 60)
+                        } as u32;
+                        st.app_state.pomo_break_mins = next;
+                        st.pomo_total_secs = next * 60;
+                        st.pomo_remaining_secs = next * 60;
+                        st.vel_w += 55.0;
+                        st.app_state.save();
+                        (next, true, st.app_state.pomo_focus_mins)
+                    } else {
+                        let cur = st.app_state.pomo_focus_mins as i32;
+                        let next = if cur == 1 && delta == 5 {
+                            5
+                        } else {
+                            (cur + delta).clamp(1, 180)
+                        } as u32;
+                        st.app_state.pomo_focus_mins = next;
+                        st.pomo_total_secs = next * 60;
+                        st.pomo_remaining_secs = next * 60;
+                        st.vel_w += 55.0;
+                        st.app_state.save();
+                        (next, false, st.app_state.pomo_break_mins)
+                    }
+                };
+                dig_adj.set_label(&format!("{:02}:00", new_mins));
+                bar_adj.set_fraction(1.0);
+                set_icon_pill_content(&start_adj, "media-playback-start-symbolic", "Mulai");
+                if is_break {
+                    mode_adj.set_label(&format!("Fokus {}m", other_mins));
+                    pb_sc_adj.set_value(new_mins.clamp(1, 60) as f64);
+                } else {
+                    mode_adj.set_label(&format!("Rehat {}m", other_mins));
+                    pf_sc_adj.set_value(new_mins.clamp(1, 120) as f64);
+                }
+            })
         };
-        sync_water();
 
-        let ctx_wa = ctx.clone();
-        let sync_w1 = sync_water.clone();
-        let hub_wa = notif_hub.clone();
-        btn_water_add.connect_clicked(move |_| {
-            let (g, goal) = {
-                let mut st = ctx_wa.borrow_mut();
-                st.app_state.water_glasses = (st.app_state.water_glasses + 1).min(20);
-                st.app_state.save();
-                (st.app_state.water_glasses, st.app_state.water_goal)
+        let adj_m5 = adjust_pomo_mins.clone();
+        btn_pomo_sub5.connect_clicked(move |_| adj_m5(-5));
+        let adj_m1 = adjust_pomo_mins.clone();
+        btn_pomo_sub1.connect_clicked(move |_| adj_m1(-1));
+        let adj_p1 = adjust_pomo_mins.clone();
+        btn_pomo_add1.connect_clicked(move |_| adj_p1(1));
+        let adj_p5 = adjust_pomo_mins;
+        btn_pomo_add5.connect_clicked(move |_| adj_p5(5));
+
+        let sync_alarm_ui: Rc<dyn Fn()> = {
+            let ctx_al = ctx.clone();
+            let dig_al = alarm_digits.clone();
+            let stat_al = alarm_status_lbl.clone();
+            let bar_al = alarm_bar.clone();
+            let btn_al = btn_alarm_toggle.clone();
+            Rc::new(move || {
+                let st = ctx_al.borrow();
+                let ah = st.app_state.alarm_hour.min(23);
+                let am = st.app_state.alarm_min.min(59);
+                dig_al.set_label(&format!("{:02}:{:02}", ah, am));
+
+                if st.alarm_ringing {
+                    stat_al.set_label("BERBUNYI! ⏰");
+                    bar_al.set_fraction(1.0);
+                    set_icon_pill_content(&btn_al, "media-playback-stop-symbolic", "Hentikan");
+                } else if st.app_state.alarm_enabled {
+                    let now = Local::now();
+                    let now_secs =
+                        (now.hour() * 3600 + now.minute() * 60 + now.second()) as i64;
+                    let target_secs = (ah * 3600 + am * 60) as i64;
+                    let mut diff = target_secs - now_secs;
+                    if diff <= 0 {
+                        diff += 86_400;
+                    }
+                    let rem_txt = if diff >= 3600 {
+                        format!("-{}j {:02}m", diff / 3600, (diff % 3600) / 60)
+                    } else {
+                        format!("-{:02}m {:02}d", diff / 60, diff % 60)
+                    };
+                    stat_al.set_label(&rem_txt);
+                    let frac = (1.0 - (diff as f64 / 3600.0).clamp(0.0, 1.0)).max(0.12);
+                    bar_al.set_fraction(frac);
+                    set_icon_pill_content(&btn_al, "media-playback-stop-symbolic", "Matikan");
+                } else {
+                    stat_al.set_label("NONAKTIF");
+                    bar_al.set_fraction(0.0);
+                    set_icon_pill_content(&btn_al, "alarm-symbolic", "Aktifkan");
+                }
+            })
+        };
+        sync_alarm_ui();
+
+        let adjust_alarm_time: Rc<dyn Fn(i32, i32)> = {
+            let ctx_at = ctx.clone();
+            let sync_at = sync_alarm_ui.clone();
+            Rc::new(move |delta_h: i32, delta_m: i32| {
+                {
+                    let mut st = ctx_at.borrow_mut();
+                    let cur_h = st.app_state.alarm_hour.min(23) as i32;
+                    let cur_m = st.app_state.alarm_min.min(59) as i32;
+                    let total_mins = (cur_h * 60 + cur_m + delta_h * 60 + delta_m).rem_euclid(1440);
+                    st.app_state.alarm_hour = (total_mins / 60) as u32;
+                    st.app_state.alarm_min = (total_mins % 60) as u32;
+                    st.alarm_ringing = false;
+                    st.alarm_ring_remaining_secs = 0;
+                    st.last_triggered_alarm_key.clear();
+                    st.vel_w += 55.0;
+                    st.app_state.save();
+                }
+                stop_alarm_chime();
+                sync_at();
+            })
+        };
+
+        let al_add_h = adjust_alarm_time.clone();
+        btn_alarm_add_h.connect_clicked(move |_| al_add_h(1, 0));
+        let al_sub_h = adjust_alarm_time.clone();
+        btn_alarm_sub_h.connect_clicked(move |_| al_sub_h(-1, 0));
+        let al_sub_m5 = adjust_alarm_time.clone();
+        btn_alarm_sub_m5.connect_clicked(move |_| al_sub_m5(0, -5));
+        let al_add_m1 = adjust_alarm_time.clone();
+        btn_alarm_add_m1.connect_clicked(move |_| al_add_m1(0, 1));
+        let al_add_m5 = adjust_alarm_time;
+        btn_alarm_add_m5.connect_clicked(move |_| al_add_m5(0, 5));
+
+        let ctx_atog = ctx.clone();
+        let sync_atog = sync_alarm_ui.clone();
+        btn_alarm_toggle.connect_clicked(move |_| {
+            let was_ringing = {
+                let mut st = ctx_atog.borrow_mut();
+                st.vel_w += 75.0;
+                if st.alarm_ringing {
+                    st.alarm_ringing = false;
+                    st.alarm_ring_remaining_secs = 0;
+                    st.app_state.alarm_enabled = false;
+                    st.app_state.save();
+                    true
+                } else {
+                    st.app_state.alarm_enabled = !st.app_state.alarm_enabled;
+                    st.last_triggered_alarm_key.clear();
+                    st.app_state.save();
+                    false
+                }
             };
-            sync_w1();
-            if g == goal {
-                hub_wa.push_notification(
-                    "Hidrasi Harian",
-                    "weather-showers-symbolic",
-                    "Target Air Putih Tercapai! 🎉",
-                    &format!("Luar biasa! Kamu sudah minum {} gelas air hari ini.", g),
-                    1,
-                    "hydration",
-                );
+            if was_ringing {
+                stop_alarm_chime();
             }
+            sync_atog();
         });
 
-        let ctx_wr = ctx.clone();
-        let sync_w2 = sync_water;
-        btn_water_reset.connect_clicked(move |_| {
+        let ctx_asnz = ctx.clone();
+        let sync_asnz = sync_alarm_ui;
+        btn_alarm_snooze.connect_clicked(move |_| {
             {
-                let mut st = ctx_wr.borrow_mut();
-                st.app_state.water_glasses = 0;
+                let mut st = ctx_asnz.borrow_mut();
+                let now = Local::now();
+                let total_mins = (now.hour() as i32 * 60 + now.minute() as i32 + 5).rem_euclid(1440);
+                st.app_state.alarm_hour = (total_mins / 60) as u32;
+                st.app_state.alarm_min = (total_mins % 60) as u32;
+                st.app_state.alarm_enabled = true;
+                st.alarm_ringing = false;
+                st.alarm_ring_remaining_secs = 0;
+                st.last_triggered_alarm_key.clear();
+                st.vel_w += 70.0;
                 st.app_state.save();
             }
-            sync_w2();
+            stop_alarm_chime();
+            sync_asnz();
         });
     }
 
@@ -2246,18 +2810,142 @@ fn build_ui(app: &gtk4::Application) {
     }
 
     let refresh_1s: CallbackSlot = new_callback_slot();
+    let dd_updating = Rc::new(RefCell::new(false));
     {
         let ctx_city = ctx.clone();
         let ref_c = refresh_1s.clone();
+        let opts_c = active_region_options.clone();
+        let upd_c = dd_updating.clone();
+        let ext_badge_c = ext_prayer_badge_lbl.clone();
         city_dropdown.connect_selected_notify(move |dd| {
+            if *upd_c.borrow() {
+                return;
+            }
             let idx = dd.selected() as usize;
-            if let Some(city) = INDONESIAN_CITIES.get(idx) {
+            let maybe_reg = opts_c.borrow().get(idx).cloned();
+            if let Some(reg) = maybe_reg {
+                ext_badge_c.set_label(&format!("{} ({})", reg.name, reg.tz_label));
                 let mut st = ctx_city.borrow_mut();
-                st.app_state.selected_city = city.name.to_string();
+                st.app_state.selected_city = reg.name;
+                st.app_state.prayer_lat = Some(reg.lat);
+                st.app_state.prayer_lon = Some(reg.lon);
+                st.app_state.prayer_tz_offset = Some(reg.tz_offset);
+                st.app_state.prayer_tz_label = Some(reg.tz_label);
+                st.vel_w += 65.0;
                 st.app_state.save();
             }
             invoke_slot(&ref_c);
         });
+
+        let update_region_dropdown: Rc<dyn Fn(Vec<PrayerRegion>, bool)> = {
+            let opts_u = active_region_options.clone();
+            let sl_u = region_str_list.clone();
+            let dd_u = city_dropdown.clone();
+            let upd_u = dd_updating.clone();
+            let ctx_u = ctx.clone();
+            let ref_u = refresh_1s.clone();
+            let ext_badge_u = ext_prayer_badge_lbl.clone();
+            Rc::new(move |new_list: Vec<PrayerRegion>, auto_apply_first: bool| {
+                if new_list.is_empty() {
+                    return;
+                }
+                *upd_u.borrow_mut() = true;
+                let labels: Vec<String> = new_list
+                    .iter()
+                    .map(|r| format!("{} ({})", r.name, r.tz_label))
+                    .collect();
+                let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                let old_len = sl_u.n_items();
+                sl_u.splice(0, old_len, &refs);
+                *opts_u.borrow_mut() = new_list.clone();
+                dd_u.set_selected(0);
+                *upd_u.borrow_mut() = false;
+
+                if auto_apply_first {
+                    if let Some(first) = new_list.into_iter().next() {
+                        ext_badge_u.set_label(&format!("{} ({})", first.name, first.tz_label));
+                        {
+                            let mut st = ctx_u.borrow_mut();
+                            st.app_state.selected_city = first.name;
+                            st.app_state.prayer_lat = Some(first.lat);
+                            st.app_state.prayer_lon = Some(first.lon);
+                            st.app_state.prayer_tz_offset = Some(first.tz_offset);
+                            st.app_state.prayer_tz_label = Some(first.tz_label);
+                            st.vel_w += 75.0;
+                            st.app_state.save();
+                        }
+                        invoke_slot(&ref_u);
+                    }
+                }
+            })
+        };
+
+        let upd_live = update_region_dropdown.clone();
+        prayer_search_entry.connect_changed(move |ent| {
+            let q = ent.text().trim().to_string();
+            let local = search_regions_local(&q);
+            if !local.is_empty() {
+                upd_live(local, false);
+            }
+        });
+
+        let trigger_region_search: Rc<dyn Fn()> = {
+            let ent_s = prayer_search_entry.clone();
+            let upd_s = update_region_dropdown.clone();
+            let title_s = prayer_title_lbl.clone();
+            Rc::new(move || {
+                let q = ent_s.text().trim().to_string();
+                if q.is_empty() {
+                    let all = search_regions_local("");
+                    upd_s(all, false);
+                    return;
+                }
+                let local = search_regions_local(&q);
+                if !local.is_empty() {
+                    upd_s(local.clone(), true);
+                } else {
+                    title_s.set_label("JADWAL SHOLAT • MENCARI KOTA/KECAMATAN...");
+                }
+
+                let slot: Arc<Mutex<Option<Vec<PrayerRegion>>>> = Arc::new(Mutex::new(None));
+                let slot_bg = slot.clone();
+                let q_bg = q.clone();
+                thread::spawn(move || {
+                    let online = search_regions_online(&q_bg);
+                    if let Ok(mut g) = slot_bg.lock() {
+                        *g = Some(online);
+                    }
+                });
+
+                let upd_cb = upd_s.clone();
+                let local_fb = local;
+                glib::timeout_add_local(Duration::from_millis(80), move || {
+                    let maybe_done = slot.lock().ok().and_then(|mut g| g.take());
+                    if let Some(online_res) = maybe_done {
+                        let mut merged = online_res;
+                        for loc in &local_fb {
+                            if !merged
+                                .iter()
+                                .any(|r| r.name.eq_ignore_ascii_case(&loc.name))
+                            {
+                                merged.push(loc.clone());
+                            }
+                        }
+                        if !merged.is_empty() {
+                            upd_cb(merged, true);
+                        }
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+            })
+        };
+
+        let tr1 = trigger_region_search.clone();
+        btn_prayer_search.connect_clicked(move |_| tr1());
+        let tr2 = trigger_region_search;
+        prayer_search_entry.connect_activate(move |_| tr2());
     }
 
     // =========================================================================
@@ -2279,6 +2967,11 @@ fn build_ui(app: &gtk4::Application) {
         let pm_dig = pomo_digits.clone();
         let pm_bar = pomo_bar.clone();
         let pm_sess = pomo_sess_lbl.clone();
+        let pm_mode_btn = btn_pomo_mode.clone();
+        let al_dig = alarm_digits.clone();
+        let al_stat = alarm_status_lbl.clone();
+        let al_bar = alarm_bar.clone();
+        let al_btn = btn_alarm_toggle.clone();
         let sh_title = prayer_title_lbl.clone();
         let sh_next = prayer_next_lbl.clone();
         let sh_pills = sholat_pills.clone();
@@ -2286,14 +2979,17 @@ fn build_ui(app: &gtk4::Application) {
         *refresh_1s.borrow_mut() = Some(Box::new(move || {
             let now = Local::now();
             let now_hm = now.format("%H:%M").to_string();
+            let today_ymd = now.format("%Y-%m-%d").to_string();
 
             let (media, metrics) = {
                 let guard = bg_mon.lock().unwrap();
                 (guard.media.clone(), guard.metrics.clone())
             };
 
-            let mut pomo_finished: Option<(bool, u32)> = None;
-            let city_name = {
+            let mut pomo_finished: Option<(bool, u32, u32)> = None;
+            let mut alarm_just_triggered: Option<(u32, u32)> = None;
+            let mut play_alarm_tick = false;
+            let active_region = {
                 let mut st = ctx_u.borrow_mut();
                 if st.pomo_running {
                     if st.pomo_remaining_secs > 0 {
@@ -2305,8 +3001,11 @@ fn build_ui(app: &gtk4::Application) {
                             st.app_state.save();
                         }
                         st.pomo_remaining_secs = st.pomo_total_secs;
-                        pomo_finished =
-                            Some((st.pomo_break_mode, st.app_state.pomo_completed_sessions));
+                        pomo_finished = Some((
+                            st.pomo_break_mode,
+                            st.app_state.pomo_completed_sessions,
+                            st.app_state.pomo_focus_mins,
+                        ));
                     }
                     let mins = st.pomo_remaining_secs / 60;
                     let secs = st.pomo_remaining_secs % 60;
@@ -2319,12 +3018,105 @@ fn build_ui(app: &gtk4::Application) {
                     st.clock_str = format!("{:02}:{:02}", mins, secs);
                 } else {
                     st.clock_str = now_hm.clone();
+                    let mins = st.pomo_remaining_secs / 60;
+                    let secs = st.pomo_remaining_secs % 60;
+                    pm_dig.set_label(&format!("{:02}:{:02}", mins, secs));
+                    if st.pomo_break_mode {
+                        pm_mode_btn.set_label(&format!(
+                            "Fokus {}m",
+                            st.app_state.pomo_focus_mins
+                        ));
+                    } else {
+                        pm_mode_btn.set_label(&format!(
+                            "Rehat {}m",
+                            st.app_state.pomo_break_mins
+                        ));
+                    }
                 }
 
-                st.app_state.selected_city.clone()
+                // Check & Update Alarm state
+                let ah = st.app_state.alarm_hour.min(23);
+                let am = st.app_state.alarm_min.min(59);
+                al_dig.set_label(&format!("{:02}:{:02}", ah, am));
+
+                if st.app_state.alarm_enabled
+                    && !st.alarm_ringing
+                    && now.hour() == ah
+                    && now.minute() == am
+                    && now.second() < 10
+                {
+                    let a_key = format!("{}-{:02}:{:02}", today_ymd, ah, am);
+                    if st.last_triggered_alarm_key != a_key {
+                        st.last_triggered_alarm_key = a_key;
+                        st.alarm_ringing = true;
+                        st.alarm_ring_remaining_secs = 24;
+                        alarm_just_triggered = Some((ah, am));
+                    }
+                }
+
+                if st.alarm_ringing {
+                    if st.alarm_ring_remaining_secs % 3 == 0 {
+                        play_alarm_tick = true;
+                    }
+                    if st.alarm_ring_remaining_secs > 1 {
+                        st.alarm_ring_remaining_secs -= 1;
+                    } else {
+                        st.alarm_ringing = false;
+                        st.alarm_ring_remaining_secs = 0;
+                        st.app_state.alarm_enabled = false;
+                        st.app_state.save();
+                    }
+                    al_stat.set_label("BERBUNYI! ⏰");
+                    al_bar.set_fraction(1.0);
+                    set_icon_pill_content(&al_btn, "media-playback-stop-symbolic", "Hentikan");
+                } else if st.app_state.alarm_enabled {
+                    let now_secs =
+                        (now.hour() * 3600 + now.minute() * 60 + now.second()) as i64;
+                    let target_secs = (ah * 3600 + am * 60) as i64;
+                    let mut diff = target_secs - now_secs;
+                    if diff <= 0 {
+                        diff += 86_400;
+                    }
+                    let rem_txt = if diff >= 3600 {
+                        format!("-{}j {:02}m", diff / 3600, (diff % 3600) / 60)
+                    } else {
+                        format!("-{:02}m {:02}d", diff / 60, diff % 60)
+                    };
+                    al_stat.set_label(&rem_txt);
+                    let frac = (1.0 - (diff as f64 / 3600.0).clamp(0.0, 1.0)).max(0.12);
+                    al_bar.set_fraction(frac);
+                    set_icon_pill_content(&al_btn, "media-playback-stop-symbolic", "Matikan");
+                } else {
+                    al_stat.set_label("NONAKTIF");
+                    al_bar.set_fraction(0.0);
+                    set_icon_pill_content(&al_btn, "alarm-symbolic", "Aktifkan");
+                }
+
+                resolve_region_from_state(
+                    &st.app_state.selected_city,
+                    st.app_state.prayer_lat,
+                    st.app_state.prayer_lon,
+                    st.app_state.prayer_tz_offset,
+                    st.app_state.prayer_tz_label.as_deref(),
+                )
             };
 
-            if let Some((was_break, total_sessions)) = pomo_finished {
+            if let Some((ah, am)) = alarm_just_triggered {
+                hub_1s.push_notification(
+                    "Alarm Pengingat",
+                    "alarm-symbolic",
+                    &format!("Alarm Pukul {:02}:{:02} Berbunyi! ⏰", ah, am),
+                    "Waktu alarm telah tiba. Buka tab Fokus untuk menghentikan atau menunda 5 menit.",
+                    2,
+                    "alarm",
+                );
+            }
+            if play_alarm_tick {
+                play_alarm_chime();
+            }
+
+            if let Some((was_break, total_sessions, focus_mins)) = pomo_finished {
+                play_alarm_chime();
                 if was_break {
                     hub_1s.push_notification(
                         "Pomodoro Fokus",
@@ -2338,7 +3130,7 @@ fn build_ui(app: &gtk4::Application) {
                     hub_1s.push_notification(
                         "Pomodoro Fokus",
                         "alarm-symbolic",
-                        "Sesi Fokus 25 Menit Selesai! 🎉",
+                        &format!("Sesi Fokus {} Menit Selesai! 🎉", focus_mins),
                         &format!(
                             "Total {} sesi fokus selesai hari ini. Ambil istirahat sejenak!",
                             total_sessions
@@ -2379,7 +3171,7 @@ fn build_ui(app: &gtk4::Application) {
                 }
             }
 
-            let sched = calculate_prayer_schedule(&city_name);
+            let sched = calculate_prayer_schedule_for_region(&active_region);
             sh_title.set_label(&format!(
                 "JADWAL SHOLAT • {} ({})",
                 sched.city.to_uppercase(),

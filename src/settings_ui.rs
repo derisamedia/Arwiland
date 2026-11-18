@@ -1,9 +1,17 @@
+use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::lyrics::{provider_accent, LyricsManager};
 use crate::notifications::{set_system_notification_banners_hidden, NotificationHub};
+use crate::prayer::{
+    resolve_region_from_state, search_regions_local, search_regions_online, PrayerRegion,
+    INDONESIAN_CITIES,
+};
 use crate::runtime::{
     make_icon_pill_btn, RuntimeContext, CANVAS_HEIGHT, CANVAS_WIDTH,
 };
@@ -15,6 +23,9 @@ pub struct SettingsHandles {
     pub ext_provider_status_lbl: gtk4::Label,
     pub btn_ext_test_notif: gtk4::Button,
     pub startup_chk: gtk4::CheckButton,
+    pub pomo_focus_scale: gtk4::Scale,
+    pub pomo_break_scale: gtk4::Scale,
+    pub ext_prayer_badge_lbl: gtk4::Label,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,11 +69,11 @@ pub fn build_settings_window(
 
     let ext_head_box = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
     ext_head_box.set_hexpand(true);
-    let ext_title = gtk4::Label::new(Some("Pengaturan Arwiland Dynamic Island"));
+    let ext_title = gtk4::Label::new(Some("Pengaturan Arwiland"));
     ext_title.add_css_class("heading-label");
     ext_title.set_halign(gtk4::Align::Start);
     let ext_sub = gtk4::Label::new(Some(
-        "Atur notifikasi Live Notch, bentuk Dynamic Island, fisika animasi, dan provider lirik.",
+        "Atur pengaturanmu disini",
     ));
     ext_sub.add_css_class("sub-label");
     ext_sub.set_halign(gtk4::Align::Start);
@@ -83,7 +94,7 @@ pub fn build_settings_window(
 
     let st_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     st_top.set_valign(gtk4::Align::Center);
-    let st_sec_lbl = gtk4::Label::new(Some("STARTUP OTOMATIS (RUN ON STARTUP)"));
+    let st_sec_lbl = gtk4::Label::new(Some("RUN ON STARTUP"));
     st_sec_lbl.add_css_class("settings-section-title");
     st_sec_lbl.set_hexpand(true);
     st_sec_lbl.set_halign(gtk4::Align::Start);
@@ -121,14 +132,14 @@ pub fn build_settings_window(
 
     let nsec_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     nsec_top.set_valign(gtk4::Align::Center);
-    let nsec_lbl = gtk4::Label::new(Some("NOTIFIKASI DYNAMIC ISLAND (LIVE NOTCH)"));
+    let nsec_lbl = gtk4::Label::new(Some("NOTIFIKASI"));
     nsec_lbl.add_css_class("settings-section-title");
     nsec_lbl.set_hexpand(true);
     nsec_lbl.set_halign(gtk4::Align::Start);
 
     let btn_ext_test_notif = make_icon_pill_btn(
         "preferences-system-notifications-symbolic",
-        "Kirim Tes Notif ke Notch",
+        "Uji Notifikasi",
         true,
     );
     nsec_top.append(&nsec_lbl);
@@ -175,6 +186,152 @@ pub fn build_settings_window(
 
     settings_root.append(&notif_set_card);
 
+    // --- SECTION 0C: POMODORO FOKUS & JADWAL SHOLAT (KOTA / KECAMATAN) ---
+    let pomo_sholat_card = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    pomo_sholat_card.add_css_class("settings-card");
+
+    let ps_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    ps_top.set_valign(gtk4::Align::Center);
+    let ps_sec_lbl = gtk4::Label::new(Some("POMODORO FOKUS & WILAYAH JADWAL SHOLAT"));
+    ps_sec_lbl.add_css_class("settings-section-title");
+    ps_sec_lbl.set_hexpand(true);
+    ps_sec_lbl.set_halign(gtk4::Align::Start);
+
+    let init_reg = {
+        let st = ctx.borrow();
+        resolve_region_from_state(
+            &st.app_state.selected_city,
+            st.app_state.prayer_lat,
+            st.app_state.prayer_lon,
+            st.app_state.prayer_tz_offset,
+            st.app_state.prayer_tz_label.as_deref(),
+        )
+    };
+    let ext_prayer_badge_lbl = gtk4::Label::new(Some(&format!(
+        "{} ({})",
+        init_reg.name, init_reg.tz_label
+    )));
+    ext_prayer_badge_lbl.add_css_class("provider-badge");
+    ps_top.append(&ps_sec_lbl);
+    ps_top.append(&ext_prayer_badge_lbl);
+    pomo_sholat_card.append(&ps_top);
+
+    // Pomodoro Focus Duration Slider + Presets
+    let pf_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    pf_row.set_valign(gtk4::Align::Center);
+    let pf_lbl = gtk4::Label::new(Some("Durasi Fokus:"));
+    pf_lbl.add_css_class("sub-label");
+    pf_lbl.set_width_chars(15);
+    pf_lbl.set_halign(gtk4::Align::Start);
+    let pomo_focus_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 1.0, 120.0, 1.0);
+    pomo_focus_scale.set_value(ctx.borrow().app_state.pomo_focus_mins.clamp(1, 120) as f64);
+    pomo_focus_scale.set_hexpand(true);
+    pomo_focus_scale.set_draw_value(false);
+    let pomo_focus_val_lbl = gtk4::Label::new(Some(&format!(
+        "{} mnt",
+        ctx.borrow().app_state.pomo_focus_mins
+    )));
+    pomo_focus_val_lbl.add_css_class("muted-label");
+    pf_row.append(&pf_lbl);
+    pf_row.append(&pomo_focus_scale);
+    pf_row.append(&pomo_focus_val_lbl);
+    pomo_sholat_card.append(&pf_row);
+
+    let pf_presets_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let pf_preset_hint = gtk4::Label::new(Some("Preset Fokus:"));
+    pf_preset_hint.add_css_class("sub-label");
+    pf_preset_hint.set_width_chars(15);
+    pf_preset_hint.set_halign(gtk4::Align::Start);
+    pf_presets_row.append(&pf_preset_hint);
+    let mut focus_preset_btns: Vec<(u32, gtk4::Button)> = Vec::new();
+    for mins in [15u32, 25, 30, 45, 60, 90] {
+        let b = gtk4::Button::with_label(&format!("{}m", mins));
+        b.add_css_class("pill-btn");
+        if ctx.borrow().app_state.pomo_focus_mins == mins {
+            b.add_css_class("primary");
+        }
+        pf_presets_row.append(&b);
+        focus_preset_btns.push((mins, b));
+    }
+    pomo_sholat_card.append(&pf_presets_row);
+
+    // Pomodoro Break Duration Slider
+    let pb_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    pb_row.set_valign(gtk4::Align::Center);
+    let pb_lbl = gtk4::Label::new(Some("Durasi Istirahat:"));
+    pb_lbl.add_css_class("sub-label");
+    pb_lbl.set_width_chars(15);
+    pb_lbl.set_halign(gtk4::Align::Start);
+    let pomo_break_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 1.0, 60.0, 1.0);
+    pomo_break_scale.set_value(ctx.borrow().app_state.pomo_break_mins.clamp(1, 60) as f64);
+    pomo_break_scale.set_hexpand(true);
+    pomo_break_scale.set_draw_value(false);
+    let pomo_break_val_lbl = gtk4::Label::new(Some(&format!(
+        "{} mnt",
+        ctx.borrow().app_state.pomo_break_mins
+    )));
+    pomo_break_val_lbl.add_css_class("muted-label");
+    pb_row.append(&pb_lbl);
+    pb_row.append(&pomo_break_scale);
+    pb_row.append(&pomo_break_val_lbl);
+    pomo_sholat_card.append(&pb_row);
+
+    // Prayer Region Search (Kota / Kecamatan)
+    let sh_search_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    sh_search_row.set_valign(gtk4::Align::Center);
+    let sh_search_lbl = gtk4::Label::new(Some("Kota/Kecamatan:"));
+    sh_search_lbl.add_css_class("sub-label");
+    sh_search_lbl.set_width_chars(15);
+    sh_search_lbl.set_halign(gtk4::Align::Start);
+
+    let ext_region_entry = gtk4::Entry::new();
+    ext_region_entry.set_placeholder_text(Some(
+        "Ketik kota atau kecamatan (mis: Kebayoran Baru, Coblong, Gubeng)...",
+    ));
+    ext_region_entry.add_css_class("island-entry");
+    ext_region_entry.set_hexpand(true);
+
+    let btn_ext_search_region =
+        make_icon_pill_btn("system-search-symbolic", "Cari Wilayah", true);
+
+    sh_search_row.append(&sh_search_lbl);
+    sh_search_row.append(&ext_region_entry);
+    sh_search_row.append(&btn_ext_search_region);
+    pomo_sholat_card.append(&sh_search_row);
+
+    let sh_dd_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    sh_dd_row.set_valign(gtk4::Align::Center);
+    let sh_dd_lbl = gtk4::Label::new(Some("Pilih Wilayah:"));
+    sh_dd_lbl.add_css_class("sub-label");
+    sh_dd_lbl.set_width_chars(15);
+    sh_dd_lbl.set_halign(gtk4::Align::Start);
+
+    let ext_regions_vec: Rc<RefCell<Vec<PrayerRegion>>> = Rc::new(RefCell::new({
+        let mut v = vec![init_reg.clone()];
+        for c in INDONESIAN_CITIES {
+            if !v.iter().any(|r| r.name.eq_ignore_ascii_case(c.name)) {
+                v.push(c.to_region());
+            }
+        }
+        v
+    }));
+    let ext_region_labels: Vec<String> = ext_regions_vec
+        .borrow()
+        .iter()
+        .map(|r| format!("{} ({})", r.name, r.tz_label))
+        .collect();
+    let ext_region_refs: Vec<&str> = ext_region_labels.iter().map(|s| s.as_str()).collect();
+    let ext_region_strlist = gtk4::StringList::new(&ext_region_refs);
+    let ext_region_dd = gtk4::DropDown::new(Some(ext_region_strlist.clone()), gtk4::Expression::NONE);
+    ext_region_dd.set_selected(0);
+    ext_region_dd.set_hexpand(true);
+
+    sh_dd_row.append(&sh_dd_lbl);
+    sh_dd_row.append(&ext_region_dd);
+    pomo_sholat_card.append(&sh_dd_row);
+
+    settings_root.append(&pomo_sholat_card);
+
     // --- SECTION 1: PROVIDER & GAYA LIRIK DINAMIS ---
     let lyr_card = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     lyr_card.add_css_class("settings-card");
@@ -195,7 +352,7 @@ pub fn build_settings_window(
     lyr_card.append(&lyr_sec_top);
 
     let prov_desc_lbl = gtk4::Label::new(Some(
-        "Pilih Provider Lirik (Mendukung Sinkronisasi Vokal Kata-per-Kata / Word-Sync):",
+        "Pilih Provider Lirik:",
     ));
     prov_desc_lbl.add_css_class("sub-label");
     prov_desc_lbl.set_halign(gtk4::Align::Start);
@@ -239,7 +396,7 @@ pub fn build_settings_window(
     }
     lyr_card.append(&prov_grid);
 
-    let lstyle_desc_lbl = gtk4::Label::new(Some("Gaya Animasi Lirik di Notch:"));
+    let lstyle_desc_lbl = gtk4::Label::new(Some("Gaya Animasi Lirik:"));
     lstyle_desc_lbl.add_css_class("sub-label");
     lstyle_desc_lbl.set_halign(gtk4::Align::Start);
     lyr_card.append(&lstyle_desc_lbl);
@@ -294,7 +451,7 @@ pub fn build_settings_window(
     let shape_card = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     shape_card.add_css_class("settings-card");
 
-    let sh_sec_lbl = gtk4::Label::new(Some("BENTUK ISLAND & ANIMASI FISIKA"));
+    let sh_sec_lbl = gtk4::Label::new(Some("BENTUK & ANIMASI"));
     sh_sec_lbl.add_css_class("settings-section-title");
     sh_sec_lbl.set_halign(gtk4::Align::Start);
     shape_card.append(&sh_sec_lbl);
@@ -524,6 +681,187 @@ pub fn build_settings_window(
             st.app_state.notif_duration_secs = val;
             st.app_state.save();
         });
+
+        let all_f_presets = Rc::new(focus_preset_btns);
+        {
+            let ctx_pf = ctx.clone();
+            let pf_val_l = pomo_focus_val_lbl.clone();
+            let presets_pf = all_f_presets.clone();
+            pomo_focus_scale.connect_value_changed(move |s| {
+                let mins = (s.value().round() as u32).clamp(1, 180);
+                pf_val_l.set_label(&format!("{} mnt", mins));
+                for (m, btn) in presets_pf.iter() {
+                    if *m == mins {
+                        btn.add_css_class("primary");
+                    } else {
+                        btn.remove_css_class("primary");
+                    }
+                }
+                let mut st = ctx_pf.borrow_mut();
+                if st.app_state.pomo_focus_mins != mins {
+                    st.app_state.pomo_focus_mins = mins;
+                    if !st.pomo_break_mode && !st.pomo_running {
+                        st.pomo_total_secs = mins * 60;
+                        st.pomo_remaining_secs = mins * 60;
+                    }
+                    st.app_state.save();
+                }
+            });
+
+            for (mins, btn) in all_f_presets.iter() {
+                let m = *mins;
+                let pf_sc = pomo_focus_scale.clone();
+                btn.connect_clicked(move |_| {
+                    pf_sc.set_value(m as f64);
+                });
+            }
+
+            let ctx_pb = ctx.clone();
+            let pb_val_l = pomo_break_val_lbl.clone();
+            pomo_break_scale.connect_value_changed(move |s| {
+                let mins = (s.value().round() as u32).clamp(1, 60);
+                pb_val_l.set_label(&format!("{} mnt", mins));
+                let mut st = ctx_pb.borrow_mut();
+                if st.app_state.pomo_break_mins != mins {
+                    st.app_state.pomo_break_mins = mins;
+                    if st.pomo_break_mode && !st.pomo_running {
+                        st.pomo_total_secs = mins * 60;
+                        st.pomo_remaining_secs = mins * 60;
+                    }
+                    st.app_state.save();
+                }
+            });
+        }
+
+        // Settings Window: Prayer Region (Kota / Kecamatan) Search & Dropdown
+        let ext_dd_updating = Rc::new(RefCell::new(false));
+        {
+            let ctx_dd = ctx.clone();
+            let regs_dd = ext_regions_vec.clone();
+            let badge_dd = ext_prayer_badge_lbl.clone();
+            let upd_flag = ext_dd_updating.clone();
+            ext_region_dd.connect_selected_notify(move |dd| {
+                if *upd_flag.borrow() {
+                    return;
+                }
+                let idx = dd.selected() as usize;
+                let maybe_reg = regs_dd.borrow().get(idx).cloned();
+                if let Some(reg) = maybe_reg {
+                    badge_dd.set_label(&format!("{} ({})", reg.name, reg.tz_label));
+                    let mut st = ctx_dd.borrow_mut();
+                    st.app_state.selected_city = reg.name;
+                    st.app_state.prayer_lat = Some(reg.lat);
+                    st.app_state.prayer_lon = Some(reg.lon);
+                    st.app_state.prayer_tz_offset = Some(reg.tz_offset);
+                    st.app_state.prayer_tz_label = Some(reg.tz_label);
+                    st.vel_w += 65.0;
+                    st.app_state.save();
+                }
+            });
+
+            let repopulate_ext_dd: Rc<dyn Fn(Vec<PrayerRegion>, bool)> = {
+                let regs_r = ext_regions_vec.clone();
+                let sl_r = ext_region_strlist.clone();
+                let dd_r = ext_region_dd.clone();
+                let upd_r = ext_dd_updating.clone();
+                let ctx_r = ctx.clone();
+                let badge_r = ext_prayer_badge_lbl.clone();
+                Rc::new(move |new_list: Vec<PrayerRegion>, auto_apply_first: bool| {
+                    if new_list.is_empty() {
+                        return;
+                    }
+                    *upd_r.borrow_mut() = true;
+                    let labels: Vec<String> = new_list
+                        .iter()
+                        .map(|r| format!("{} ({})", r.name, r.tz_label))
+                        .collect();
+                    let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                    let old_len = sl_r.n_items();
+                    sl_r.splice(0, old_len, &refs);
+                    *regs_r.borrow_mut() = new_list.clone();
+                    dd_r.set_selected(0);
+                    *upd_r.borrow_mut() = false;
+
+                    if auto_apply_first {
+                        if let Some(first) = new_list.into_iter().next() {
+                            badge_r.set_label(&format!("{} ({})", first.name, first.tz_label));
+                            let mut st = ctx_r.borrow_mut();
+                            st.app_state.selected_city = first.name;
+                            st.app_state.prayer_lat = Some(first.lat);
+                            st.app_state.prayer_lon = Some(first.lon);
+                            st.app_state.prayer_tz_offset = Some(first.tz_offset);
+                            st.app_state.prayer_tz_label = Some(first.tz_label);
+                            st.vel_w += 75.0;
+                            st.app_state.save();
+                        }
+                    }
+                })
+            };
+
+            let repop_live = repopulate_ext_dd.clone();
+            ext_region_entry.connect_changed(move |ent| {
+                let q = ent.text().trim().to_string();
+                let local = search_regions_local(&q);
+                if !local.is_empty() {
+                    repop_live(local, false);
+                }
+            });
+
+            let do_ext_search: Rc<dyn Fn()> = {
+                let ent_s = ext_region_entry.clone();
+                let repop_s = repopulate_ext_dd.clone();
+                let badge_s = ext_prayer_badge_lbl.clone();
+                Rc::new(move || {
+                    let q = ent_s.text().trim().to_string();
+                    if q.is_empty() {
+                        let all = search_regions_local("");
+                        repop_s(all, false);
+                        return;
+                    }
+                    let local = search_regions_local(&q);
+                    if !local.is_empty() {
+                        repop_s(local.clone(), true);
+                    }
+                    badge_s.set_label("Mencari Kecamatan/Kota...");
+                    let slot: Arc<Mutex<Option<Vec<PrayerRegion>>>> = Arc::new(Mutex::new(None));
+                    let slot_bg = slot.clone();
+                    let q_bg = q.clone();
+                    thread::spawn(move || {
+                        let online = search_regions_online(&q_bg);
+                        if let Ok(mut g) = slot_bg.lock() {
+                            *g = Some(online);
+                        }
+                    });
+                    let repop_cb = repop_s.clone();
+                    let local_fallback = local;
+                    glib::timeout_add_local(Duration::from_millis(80), move || {
+                        let maybe_done = slot.lock().ok().and_then(|mut g| g.take());
+                        if let Some(online_res) = maybe_done {
+                            let mut merged = online_res;
+                            for loc in &local_fallback {
+                                if !merged
+                                    .iter()
+                                    .any(|r| r.name.eq_ignore_ascii_case(&loc.name))
+                                {
+                                    merged.push(loc.clone());
+                                }
+                            }
+                            if !merged.is_empty() {
+                                repop_cb(merged, true);
+                            }
+                            glib::ControlFlow::Break
+                        } else {
+                            glib::ControlFlow::Continue
+                        }
+                    });
+                })
+            };
+
+            let ds1 = do_ext_search.clone();
+            btn_ext_search_region.connect_clicked(move |_| ds1());
+            let ds2 = do_ext_search;
+            ext_region_entry.connect_activate(move |_| ds2());
+        }
     }
 
     {
@@ -754,6 +1092,8 @@ pub fn build_settings_window(
             let sb_ck = suppress_banners_chk;
             let se_ck = sys_events_chk;
             let nd_sc = notif_dur_scale;
+            let pf_sc = pomo_focus_scale.clone();
+            let pb_sc = pomo_break_scale.clone();
             let provs = all_prov_r;
             let lstyles = all_lstyle_r;
 
@@ -790,6 +1130,8 @@ pub fn build_settings_window(
                 sb_ck.set_active(true);
                 se_ck.set_active(true);
                 nd_sc.set_value(5.0);
+                pf_sc.set_value(25.0);
+                pb_sc.set_value(5.0);
 
                 l_mgr_res.clear_cache();
                 {
@@ -804,6 +1146,12 @@ pub fn build_settings_window(
                     st.app_state.suppress_system_banners = true;
                     st.app_state.system_event_notifs = true;
                     st.app_state.notif_duration_secs = 5;
+                    st.app_state.pomo_focus_mins = 25;
+                    st.app_state.pomo_break_mins = 5;
+                    if !st.pomo_running {
+                        st.pomo_total_secs = if st.pomo_break_mode { 5 * 60 } else { 25 * 60 };
+                        st.pomo_remaining_secs = st.pomo_total_secs;
+                    }
                     st.app_state.lyric_provider = "auto".to_string();
                     st.app_state.lyric_style = "word_bounce".to_string();
                     st.app_state.lyric_offset_ms = 0;
@@ -836,5 +1184,8 @@ pub fn build_settings_window(
         ext_provider_status_lbl,
         btn_ext_test_notif,
         startup_chk,
+        pomo_focus_scale,
+        pomo_break_scale,
+        ext_prayer_badge_lbl,
     }
 }

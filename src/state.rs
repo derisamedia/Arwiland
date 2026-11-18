@@ -49,6 +49,22 @@ fn default_notif_duration() -> i32 {
     5
 }
 
+fn default_pomo_focus_mins() -> u32 {
+    25
+}
+
+fn default_pomo_break_mins() -> u32 {
+    5
+}
+
+fn default_alarm_hour() -> u32 {
+    7
+}
+
+fn default_alarm_min() -> u32 {
+    0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub todos: Vec<TodoItem>,
@@ -57,10 +73,28 @@ pub struct AppState {
     pub water_goal: u32,
     pub last_date: String,
     pub selected_city: String,
+    #[serde(default)]
+    pub prayer_lat: Option<f64>,
+    #[serde(default)]
+    pub prayer_lon: Option<f64>,
+    #[serde(default)]
+    pub prayer_tz_offset: Option<f64>,
+    #[serde(default)]
+    pub prayer_tz_label: Option<String>,
     pub pinned: bool,
     pub auto_collapse: bool,
     pub y_offset: i32,
     pub pomo_completed_sessions: u32,
+    #[serde(default = "default_pomo_focus_mins")]
+    pub pomo_focus_mins: u32,
+    #[serde(default = "default_pomo_break_mins")]
+    pub pomo_break_mins: u32,
+    #[serde(default = "default_alarm_hour")]
+    pub alarm_hour: u32,
+    #[serde(default = "default_alarm_min")]
+    pub alarm_min: u32,
+    #[serde(default)]
+    pub alarm_enabled: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
     #[serde(default = "default_anim_preset")]
@@ -117,10 +151,19 @@ impl Default for AppState {
             water_goal: 8,
             last_date: today,
             selected_city: "Jakarta".to_string(),
+            prayer_lat: None,
+            prayer_lon: None,
+            prayer_tz_offset: None,
+            prayer_tz_label: None,
             pinned: false,
             auto_collapse: true,
             y_offset: 0,
             pomo_completed_sessions: 0,
+            pomo_focus_mins: 25,
+            pomo_break_mins: 5,
+            alarm_hour: 7,
+            alarm_min: 0,
+            alarm_enabled: false,
             island_style: "notch".to_string(),
             anim_preset: "smooth".to_string(),
             compact_width: 300,
@@ -175,6 +218,10 @@ impl AppState {
                 if state.notif_duration_secs < 2 || state.notif_duration_secs > 15 {
                     state.notif_duration_secs = 5;
                 }
+                state.pomo_focus_mins = state.pomo_focus_mins.clamp(1, 180);
+                state.pomo_break_mins = state.pomo_break_mins.clamp(1, 60);
+                state.alarm_hour = state.alarm_hour.min(23);
+                state.alarm_min = state.alarm_min.min(59);
                 if is_autostart_installed() != state.run_on_startup {
                     let _ = set_autostart_enabled(state.run_on_startup);
                 }

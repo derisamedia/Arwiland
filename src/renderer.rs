@@ -928,11 +928,16 @@ pub fn draw_media_card_lyrics_and_progress(
 
     let track_x = 2.0;
     let track_w = (wf - 4.0).max(40.0);
-    let track_y = 6.0;
-    let track_h = 4.2;
+    let track_y = if st.media_seek_dragging { 5.2 } else { 6.0 };
+    let track_h = if st.media_seek_dragging { 5.8 } else { 4.2 };
 
     cairo_rounded_rect(cr, track_x, track_y, track_w, track_h, track_h * 0.5);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+    cr.set_source_rgba(
+        1.0,
+        1.0,
+        1.0,
+        if st.media_seek_dragging { 0.22 } else { 0.14 },
+    );
     let _ = cr.fill();
 
     let fill_w = (track_w * frac).max(if frac > 0.002 { track_h } else { 0.0 });
@@ -942,11 +947,18 @@ pub fn draw_media_card_lyrics_and_progress(
         let _ = cr.fill();
     }
 
-    let knob_x = (track_x + track_w * frac).clamp(track_x + 4.5, track_x + track_w - 4.5);
+    let knob_r = if st.media_seek_dragging { 6.6 } else { 5.2 };
+    let knob_x = (track_x + track_w * frac).clamp(track_x + knob_r, track_x + track_w - knob_r);
     let knob_y = track_y + track_h * 0.5;
-    cr.arc(knob_x, knob_y, 5.2, 0.0, 2.0 * PI);
+    cr.arc(knob_x, knob_y, knob_r, 0.0, 2.0 * PI);
     cr.set_source_rgba(0.98, 0.99, 1.0, 0.98);
     let _ = cr.fill();
+
+    if st.media_seek_dragging {
+        cr.arc(knob_x, knob_y, 2.4, 0.0, 2.0 * PI);
+        cr.set_source_rgba(ar, ag, ab, 0.95);
+        let _ = cr.fill();
+    }
 
     let mut font_time = gtk4::pango::FontDescription::from_string("Inter, Cantarell, Sans 8.5");
     font_time.set_weight(gtk4::pango::Weight::Medium);
