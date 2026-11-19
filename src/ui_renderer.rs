@@ -129,8 +129,10 @@ pub struct FontEngine {
 
 impl FontEngine {
     pub fn load() -> Result<Self, String> {
-        // Exact original GNOME UI font (Cantarell 98 KB) + clean modern fallbacks (OpenSans, Inter, Liberation, DejaVu)
+        // Exact original GNOME UI font (Cantarell 98 KB) + Windows Segoe UI + clean modern Linux fallbacks
         let regular_candidates = [
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
             "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
             "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
             "/usr/share/fonts/open-sans/OpenSans-Regular.ttf",
@@ -143,6 +145,9 @@ impl FontEngine {
             "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
         ];
         let bold_candidates = [
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+            "C:\\Windows\\Fonts\\seguisb.ttf",
+            "C:\\Windows\\Fonts\\arialbd.ttf",
             "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Bold.otf",
             "/usr/share/fonts/cantarell/Cantarell-Bold.otf",
             "/usr/share/fonts/open-sans/OpenSans-Semibold.ttf",

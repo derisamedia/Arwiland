@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod lyrics;
 mod mpris;
 mod notifications;
@@ -6,10 +8,14 @@ mod runtime;
 mod state;
 mod sysinfo;
 mod ui_renderer;
+#[cfg(target_os = "windows")]
+mod win32_window;
+#[cfg(target_os = "linux")]
 mod x11_window;
 
 use chrono::{Local, Timelike};
 use std::path::PathBuf;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,15 +37,20 @@ use runtime::{
 use state::{format_file_size, set_autostart_enabled, ShelfFile, TodoItem};
 use sysinfo::{get_live_volume_fast, set_system_volume, toggle_system_mute};
 use ui_renderer::{render_island, FontEngine, UiAction, UiHitMap};
-use x11_window::{WindowEvent, X11OverlayWindow};
+#[cfg(target_os = "windows")]
+use win32_window::{Win32OverlayWindow as OverlayWindow, WindowEvent};
+#[cfg(target_os = "linux")]
+use x11_window::{WindowEvent, X11OverlayWindow as OverlayWindow};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+#[cfg(unix)]
 extern "C" fn handle_signal(_sig: libc::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
 fn install_signal_handlers() {
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGTERM, handle_signal as *const () as usize);
         libc::signal(libc::SIGINT, handle_signal as *const () as usize);
@@ -47,23 +58,30 @@ fn install_signal_handlers() {
 }
 
 fn play_alert_sound() {
-    thread::spawn(|| {
-        let candidates = [
-            "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
-            "/usr/share/sounds/freedesktop/stereo/complete.oga",
-            "/usr/share/sounds/freedesktop/stereo/message.oga",
-        ];
-        for p in candidates {
-            if std::path::Path::new(p).exists() {
-                if Command::new("paplay").arg(p).status().is_ok() {
-                    return;
-                }
-                if Command::new("pw-play").arg(p).status().is_ok() {
-                    return;
+    #[cfg(target_os = "windows")]
+    {
+        thread::spawn(win32_window::play_alert_beep);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        thread::spawn(|| {
+            let candidates = [
+                "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+                "/usr/share/sounds/freedesktop/stereo/complete.oga",
+                "/usr/share/sounds/freedesktop/stereo/message.oga",
+            ];
+            for p in candidates {
+                if std::path::Path::new(p).exists() {
+                    if Command::new("paplay").arg(p).status().is_ok() {
+                        return;
+                    }
+                    if Command::new("pw-play").arg(p).status().is_ok() {
+                        return;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 fn update_target_size(ctx: &mut RuntimeContext) {
@@ -180,7 +198,7 @@ fn main() {
 
     let initial_state = state::AppState::load();
     let init_is_bottom = initial_state.island_position == "bottom";
-    let mut win = match X11OverlayWindow::new(
+    let mut win = match OverlayWindow::new(
         CANVAS_WIDTH as u16,
         CANVAS_HEIGHT as u16,
         init_is_bottom,
@@ -592,28 +610,38 @@ fn main() {
                                     UiAction::ShelfPickFile => {
                                         let slot = pending_picked_files.clone();
                                         thread::spawn(move || {
-                                            let out = Command::new("zenity")
-                                                .args(["--file-selection", "--multiple", "--separator=\n", "--title=Pilih File untuk Rak Arwiland"])
-                                                .output()
-                                                .or_else(|_| {
-                                                    Command::new("kdialog")
-                                                        .args(["--getopenfilename", "--multiple", "--separate-output"])
-                                                        .output()
-                                                });
-                                            if let Ok(o) = out {
-                                                if o.status.success() {
-                                                    let txt = String::from_utf8_lossy(&o.stdout);
-                                                    let paths: Vec<PathBuf> = txt
-                                                        .lines()
-                                                        .map(|s| s.trim())
-                                                        .filter(|s| !s.is_empty())
-                                                        .map(PathBuf::from)
-                                                        .collect();
-                                                    if !paths.is_empty() {
-                                                        if let Ok(mut guard) = slot.lock() {
-                                                            guard.extend(paths);
-                                                        }
+                                            #[cfg(target_os = "windows")]
+                                            let paths = win32_window::pick_files_dialog();
+
+                                            #[cfg(not(target_os = "windows"))]
+                                            let paths: Vec<PathBuf> = {
+                                                let out = Command::new("zenity")
+                                                    .args(["--file-selection", "--multiple", "--separator=\n", "--title=Pilih File untuk Rak Arwiland"])
+                                                    .output()
+                                                    .or_else(|_| {
+                                                        Command::new("kdialog")
+                                                            .args(["--getopenfilename", "--multiple", "--separate-output"])
+                                                            .output()
+                                                    });
+                                                if let Ok(o) = out {
+                                                    if o.status.success() {
+                                                        let txt = String::from_utf8_lossy(&o.stdout);
+                                                        txt.lines()
+                                                            .map(|s| s.trim())
+                                                            .filter(|s| !s.is_empty())
+                                                            .map(PathBuf::from)
+                                                            .collect()
+                                                    } else {
+                                                        Vec::new()
                                                     }
+                                                } else {
+                                                    Vec::new()
+                                                }
+                                            };
+
+                                            if !paths.is_empty() {
+                                                if let Ok(mut guard) = slot.lock() {
+                                                    guard.extend(paths);
                                                 }
                                             }
                                         });
@@ -627,6 +655,9 @@ fn main() {
                                     UiAction::ShelfOpen(idx) => {
                                         if let Some(f) = ctx.app_state.shelf_files.get(idx) {
                                             let p = f.path.clone();
+                                            #[cfg(target_os = "windows")]
+                                            win32_window::open_file_default(&p);
+                                            #[cfg(not(target_os = "windows"))]
                                             let _ = Command::new("xdg-open").arg(p).spawn();
                                         }
                                     }

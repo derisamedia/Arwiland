@@ -1,0 +1,251 @@
+name: Build & Release Arwiland (Pure Rust - Linux & Windows)
+
+on:
+  push:
+    branches: [ "no-gtk4", "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "no-gtk4", "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ===========================================================================
+  # 1. LINUX NATIVE BUILD (Pure Rust, Zero GTK4 -> .deb, .rpm, .tar.gz)
+  # ===========================================================================
+  build-linux:
+    name: Build Linux (Pure Rust - .deb / .rpm / Portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Packaging Tool (rpm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Pure-Rust Linux Release Binary
+        run: cargo build --release
+
+      - name: Verify Zero GTK4 Dependencies
+        run: |
+          ls -lh target/release/arwiland
+          ldd target/release/arwiland
+
+      - name: Package Linux (.deb, .rpm, Portable .tar.gz)
+        run: |
+          # --- 1. Portable tar.gz ---
+          mkdir -p dist-linux/Arwiland
+          cp target/release/arwiland dist-linux/Arwiland/
+          cp assets/arwiland.svg dist-linux/Arwiland/
+          cp install.sh run.sh dist-linux/Arwiland/
+          chmod +x dist-linux/Arwiland/arwiland dist-linux/Arwiland/install.sh dist-linux/Arwiland/run.sh
+          tar -czf Arwiland-Linux-x86_64-Portable.tar.gz -C dist-linux Arwiland
+
+          # --- 2. Debian / Ubuntu (.deb) ---
+          mkdir -p pkg-deb/DEBIAN
+          mkdir -p pkg-deb/usr/bin
+          mkdir -p pkg-deb/usr/share/applications
+          mkdir -p pkg-deb/usr/share/icons/hicolor/scalable/apps
+          mkdir -p pkg-deb/etc/xdg/autostart
+
+          cp target/release/arwiland pkg-deb/usr/bin/arwiland
+          chmod 755 pkg-deb/usr/bin/arwiland
+          cp assets/arwiland.svg pkg-deb/usr/share/icons/hicolor/scalable/apps/arwiland.svg
+
+          cat << 'EOF' > pkg-deb/usr/share/applications/arwiland.desktop
+          [Desktop Entry]
+          Type=Application
+          Version=1.0
+          Name=Arwiland
+          GenericName=Dynamic Island & Living Notch
+          Comment=Ultra-Lightweight Pure-Rust Dynamic Island & Living Notch
+          Exec=env MALLOC_ARENA_MAX=2 /usr/bin/arwiland
+          Icon=arwiland
+          Terminal=false
+          Categories=Utility;
+          StartupNotify=false
+          EOF
+
+          cp pkg-deb/usr/share/applications/arwiland.desktop pkg-deb/etc/xdg/autostart/arwiland.desktop
+
+          cat << 'EOF' > pkg-deb/DEBIAN/control
+          Package: arwiland
+          Version: 0.0.1
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6, curl
+          Maintainer: Arwiyah <yuimizuno86@gmail.com>
+          Description: Arwiland - Ultra-Lightweight Dynamic Island & Living Notch
+           Pure-Rust zero-GTK4 Dynamic Island & Living Notch with Media Player,
+           Word-Synced Lyrics, Notifications, Focus Timer, To-Do, File Shelf, and Prayer Times.
+          EOF
+
+          dpkg-deb --build pkg-deb Arwiland-Linux-amd64.deb
+
+          # --- 3. Fedora / RHEL / openSUSE (.rpm) ---
+          RPM_TOP="$(pwd)/rpmbuild"
+          mkdir -p "$RPM_TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          cat << EOF > "$RPM_TOP/SPECS/arwiland.spec"
+          Name:           arwiland
+          Version:        0.0.1
+          Release:        1
+          Summary:        Arwiland - Ultra-Lightweight Dynamic Island & Living Notch
+          License:        MIT
+          BuildArch:      x86_64
+          AutoReqProv:    no
+          Requires:       glibc, curl
+
+          %description
+          Pure-Rust zero-GTK4 Dynamic Island & Living Notch with Media Player,
+          Word-Synced Lyrics, Notifications, Focus Timer, To-Do, File Shelf, and Prayer Times.
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          mkdir -p %{buildroot}/usr/share/icons/hicolor/scalable/apps
+          mkdir -p %{buildroot}/etc/xdg/autostart
+          install -m 755 "$(pwd)/target/release/arwiland" %{buildroot}/usr/bin/arwiland
+          install -m 644 "$(pwd)/assets/arwiland.svg" %{buildroot}/usr/share/icons/hicolor/scalable/apps/arwiland.svg
+          install -m 644 "$(pwd)/pkg-deb/usr/share/applications/arwiland.desktop" %{buildroot}/usr/share/applications/arwiland.desktop
+          install -m 644 "$(pwd)/pkg-deb/etc/xdg/autostart/arwiland.desktop" %{buildroot}/etc/xdg/autostart/arwiland.desktop
+
+          %files
+          /usr/bin/arwiland
+          /usr/share/applications/arwiland.desktop
+          /usr/share/icons/hicolor/scalable/apps/arwiland.svg
+          /etc/xdg/autostart/arwiland.desktop
+          EOF
+
+          rpmbuild --define "_topdir $RPM_TOP" -bb "$RPM_TOP/SPECS/arwiland.spec"
+          cp "$RPM_TOP"/RPMS/x86_64/*.rpm Arwiland-Linux-x86_64.rpm
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Arwiland-Linux
+          path: |
+            Arwiland-Linux-amd64.deb
+            Arwiland-Linux-x86_64.rpm
+            Arwiland-Linux-x86_64-Portable.tar.gz
+
+  # ===========================================================================
+  # 2. WINDOWS 10/11 NATIVE BUILD (Pure Rust Win32/WinRT, Zero DLLs!)
+  # ===========================================================================
+  build-windows:
+    name: Build Windows 10/11 (Pure Rust - .exe & Setup.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Standalone Native Windows Executable
+        run: cargo build --release
+
+      - name: Package Portable .zip & NSIS Setup.exe
+        shell: pwsh
+        run: |
+          Get-Item target\release\arwiland.exe | Select-Object Name, Length
+
+          # --- 1. Portable Zip (Single standalone .exe, zero external DLLs!) ---
+          New-Item -ItemType Directory -Force -Path dist-win | Out-Null
+          Copy-Item target\release\arwiland.exe dist-win\arwiland.exe
+          if (Test-Path README.md) { Copy-Item README.md dist-win\README.md }
+          Compress-Archive -Path dist-win\* -DestinationPath Arwiland-Windows-x64-Portable.zip -Force
+
+          # --- 2. NSIS Installer (Setup.exe) ---
+          $nsis = @'
+          !include "MUI2.nsh"
+          Name "Arwiland v0.0.1"
+          OutFile "Arwiland-Windows-x64-Setup.exe"
+          InstallDir "$LOCALAPPDATA\Programs\Arwiland"
+          RequestExecutionLevel user
+
+          !define MUI_ABORTWARNING
+          !define MUI_FINISHPAGE_RUN "$INSTDIR\arwiland.exe"
+          !define MUI_FINISHPAGE_RUN_TEXT "Jalankan Arwiland sekarang"
+
+          !insertmacro MUI_PAGE_WELCOME
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
+
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+
+          !insertmacro MUI_LANGUAGE "Indonesian"
+          !insertmacro MUI_LANGUAGE "English"
+
+          Section "Install"
+            SetOutPath "$INSTDIR"
+            File "target\release\arwiland.exe"
+            CreateDirectory "$SMPROGRAMS\Arwiland"
+            CreateShortCut "$SMPROGRAMS\Arwiland\Arwiland.lnk" "$INSTDIR\arwiland.exe"
+            CreateShortCut "$DESKTOP\Arwiland.lnk" "$INSTDIR\arwiland.exe"
+            WriteUninstaller "$INSTDIR\Uninstall.exe"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayName" "Arwiland - Dynamic Island & Living Notch"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayVersion" "0.0.1"
+          SectionEnd
+
+          Section "Uninstall"
+            nsExec::ExecToStack 'taskkill /F /IM arwiland.exe'
+            Delete "$INSTDIR\arwiland.exe"
+            Delete "$INSTDIR\Uninstall.exe"
+            RMDir "$INSTDIR"
+            Delete "$SMPROGRAMS\Arwiland\Arwiland.lnk"
+            RMDir "$SMPROGRAMS\Arwiland"
+            Delete "$DESKTOP\Arwiland.lnk"
+            Delete "$SMSTARTUP\Arwiland.cmd"
+            DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland"
+          SectionEnd
+          '@
+          Set-Content -Path installer.nsi -Value $nsis -Encoding UTF8
+
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $makensis) {
+            $env:Path += ";C:\Program Files (x86)\NSIS"
+          }
+          makensis installer.nsi
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Arwiland-Windows
+          path: |
+            target/release/arwiland.exe
+            Arwiland-Windows-x64-Portable.zip
+            Arwiland-Windows-x64-Setup.exe
+
+  # ===========================================================================
+  # 3. AUTO-PUBLISH TO GITHUB RELEASES (on tags v* or manual dispatch)
+  # ===========================================================================
+  release:
+    name: Publish GitHub Release
+    needs: [ build-linux, build-windows ]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.0.1-pure-rust' }}
+          name: Arwiland Pure-Rust (Linux & Windows 10/11)
+          generate_release_notes: true
+          files: |
+            release-assets/Arwiland-Linux/*
+            release-assets/Arwiland-Windows/*

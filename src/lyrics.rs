@@ -4,6 +4,17 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+fn silent_cmd(prog: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(prog);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 #[derive(Clone, Debug)]
 pub struct LyricWord {
     pub text: String,
@@ -1245,7 +1256,7 @@ except Exception:
     sys.exit(1)
 "#;
 
-    let out = Command::new("python3")
+    let out = silent_cmd("python3")
         .args(["-c", py_script, clean_title, artist])
         .output()
         .ok()?;
@@ -1269,7 +1280,7 @@ except Exception:
 /// Youtube Auto Captions (`yt_captions`) Word-Level ASR `json3`
 fn try_fetch_youtube_captions(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
     let query = format!("{} {} official", clean_title, artist);
-    let search_out = Command::new("curl")
+    let search_out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1298,7 +1309,7 @@ fn try_fetch_youtube_captions(clean_title: &str, artist: &str) -> Option<TrackLy
         return None;
     }
 
-    let watch_out = Command::new("curl")
+    let watch_out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1343,7 +1354,7 @@ fn try_fetch_youtube_captions(clean_title: &str, artist: &str) -> Option<TrackLy
 
     let base_url = chosen_url?;
     let json3_url = format!("{}&fmt=json3", base_url);
-    if let Ok(cap_out) = Command::new("curl")
+    if let Ok(cap_out) = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1375,7 +1386,7 @@ fn try_fetch_youtube_captions(clean_title: &str, artist: &str) -> Option<TrackLy
 
 /// YouLy Plus (`youlyplus`) Word-Synced TTML
 fn try_fetch_youlyplus(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let out = Command::new("curl")
+    let out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1412,7 +1423,7 @@ fn try_fetch_youlyplus(clean_title: &str, artist: &str) -> Option<TrackLyricsSta
 
 /// Apple Music (`apple`) Word-Synced TTML
 fn try_fetch_apple_ttml(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let out = Command::new("curl")
+    let out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1449,7 +1460,7 @@ fn try_fetch_apple_ttml(clean_title: &str, artist: &str) -> Option<TrackLyricsSt
 /// SimpMusic (`simpmusic`) RichSync Word-Synced Lyrics
 fn try_fetch_simpmusic(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
     let query = format!("{} {}", clean_title, artist);
-    if let Ok(out) = Command::new("curl")
+    if let Ok(out) = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1508,7 +1519,7 @@ fn try_fetch_simpmusic(clean_title: &str, artist: &str) -> Option<TrackLyricsSta
 /// LrcLib (`lrclib`) Enhanced `<mm:ss.xx>` Word-Sync
 fn try_fetch_lrclib_enhanced(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
     let query = format!("{} {}", clean_title, artist);
-    let out = Command::new("curl")
+    let out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1549,7 +1560,7 @@ fn try_fetch_lrclib_enhanced(clean_title: &str, artist: &str) -> Option<TrackLyr
 /// NetEase (`netease`) 163 YRC & K-Lyric Word-by-Word
 fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
     let query = format!("{} {}", clean_title, artist);
-    let search_out = Command::new("curl")
+    let search_out = silent_cmd("curl")
         .args([
             "-4",
             "--connect-timeout",
@@ -1573,7 +1584,7 @@ fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState
     let songs = resp.result.and_then(|r| r.songs)?;
 
     for song in songs.into_iter().take(2) {
-        let lyr_out = Command::new("curl")
+        let lyr_out = silent_cmd("curl")
             .args([
                 "-4",
                 "--connect-timeout",

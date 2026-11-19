@@ -1,6 +1,14 @@
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -122,6 +130,88 @@ fn format_player_name(bus: &str) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn win_ensure_com() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+            done.set(true);
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn win_format_app_name(aumid: &str) -> String {
+    let low = aumid.to_lowercase();
+    if low.contains("spotify") {
+        "Spotify".to_string()
+    } else if low.contains("chrome") {
+        "Google Chrome".to_string()
+    } else if low.contains("msedge") || low.contains("edge") {
+        "Microsoft Edge".to_string()
+    } else if low.contains("firefox") {
+        "Firefox".to_string()
+    } else if low.contains("vlc") {
+        "VLC Media".to_string()
+    } else if low.contains("brave") {
+        "Brave".to_string()
+    } else if low.contains("opera") {
+        "Opera".to_string()
+    } else if low.contains("zune") || low.contains("mediaplayer") {
+        "Media Player".to_string()
+    } else {
+        let base = aumid
+            .rsplit('\\')
+            .next()
+            .unwrap_or(aumid)
+            .split('!')
+            .next()
+            .unwrap_or("Media")
+            .trim_end_matches(".exe");
+        let mut c = base.chars();
+        match c.next() {
+            None => "Media".to_string(),
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win_pick_session() -> Option<GlobalSystemMediaTransportControlsSession> {
+    win_ensure_com();
+    let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+        .ok()?
+        .get()
+        .ok()?;
+    let mut fallback = mgr.GetCurrentSession().ok();
+    if let Ok(list) = mgr.GetSessions() {
+        let count = list.Size().unwrap_or(0);
+        for i in 0..count {
+            if let Ok(sess) = list.GetAt(i) {
+                let is_playing = sess
+                    .GetPlaybackInfo()
+                    .ok()
+                    .and_then(|pi| pi.PlaybackStatus().ok())
+                    .map(|st| st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                    .unwrap_or(false);
+                if is_playing {
+                    return Some(sess);
+                }
+                if fallback.is_none() {
+                    fallback = Some(sess);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+#[allow(dead_code)]
 pub fn find_all_mpris_buses() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
@@ -312,6 +402,97 @@ pub fn query_media_status() -> MediaStatus {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(sess) = win_pick_session() {
+            let aumid = sess
+                .SourceAppUserModelId()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|_| "Media".to_string());
+            let player_name = win_format_app_name(&aumid);
+            let playing = sess
+                .GetPlaybackInfo()
+                .ok()
+                .and_then(|pi| pi.PlaybackStatus().ok())
+                .map(|st| st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                .unwrap_or(false);
+
+            let (title, artist) = sess
+                .TryGetMediaPropertiesAsync()
+                .ok()
+                .and_then(|op| op.get().ok())
+                .map(|props| {
+                    let t = props
+                        .Title()
+                        .map(|s| s.to_string_lossy().trim().to_string())
+                        .unwrap_or_default();
+                    let a = props
+                        .Artist()
+                        .map(|s| s.to_string_lossy().trim().to_string())
+                        .unwrap_or_default();
+                    (
+                        if t.is_empty() {
+                            "Media Aktif".to_string()
+                        } else {
+                            t
+                        },
+                        if a.is_empty() {
+                            player_name.clone()
+                        } else {
+                            a
+                        },
+                    )
+                })
+                .unwrap_or_else(|| ("Media Aktif".to_string(), player_name.clone()));
+
+            let (pos_f64, len_secs) = sess
+                .GetTimelineProperties()
+                .ok()
+                .map(|tl| {
+                    let pos_ticks = tl.Position().map(|d| d.Duration).unwrap_or(0).max(0);
+                    let end_ticks = tl.EndTime().map(|d| d.Duration).unwrap_or(0).max(0);
+                    let mut pos = pos_ticks as f64 / 10_000_000.0;
+                    let len = (end_ticks as f64 / 10_000_000.0).max(0.0);
+                    if playing {
+                        if let Ok(last_upd) = tl.LastUpdatedTime() {
+                            // Windows FILETIME epoch = 1601-01-01; Unix epoch delta = 11644473600s
+                            if last_upd.UniversalTime > 116_444_736_000_000_000 {
+                                let upd_unix_s = (last_upd.UniversalTime
+                                    - 116_444_736_000_000_000)
+                                    as f64
+                                    / 10_000_000.0;
+                                let now_unix_s = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs_f64())
+                                    .unwrap_or(upd_unix_s);
+                                let delta = (now_unix_s - upd_unix_s).clamp(0.0, 30.0);
+                                pos += delta;
+                                if len > 0.5 {
+                                    pos = pos.min(len);
+                                }
+                            }
+                        }
+                    }
+                    (pos.max(0.0), len.round() as u64)
+                })
+                .unwrap_or((0.0, 0));
+
+            return MediaStatus {
+                active_bus: Some(aumid),
+                track_id: None,
+                has_player: true,
+                player_name,
+                title,
+                artist,
+                art_path: None,
+                playing,
+                position_secs: pos_f64 as u64,
+                position_f64: pos_f64,
+                length_secs: len_secs,
+            };
+        }
+    }
+
     MediaStatus {
         active_bus: None,
         track_id: None,
@@ -404,7 +585,21 @@ pub fn seek_media_to(
         .is_ok()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (cached_bus, cached_track_id);
+        if let Some(sess) = win_pick_session() {
+            let ticks = (target_secs.max(0.0) * 10_000_000.0).round() as i64;
+            return sess
+                .TryChangePlaybackPositionAsync(ticks)
+                .ok()
+                .and_then(|op| op.get().ok())
+                .unwrap_or(false);
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (cached_bus, cached_track_id, target_secs);
         false
@@ -434,7 +629,21 @@ pub fn send_mpris_command(method: &str) -> bool {
         .is_ok()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(sess) = win_pick_session() {
+            let op = match method {
+                "PlayPause" => sess.TryTogglePlayPauseAsync(),
+                "Next" => sess.TrySkipNextAsync(),
+                "Previous" => sess.TrySkipPreviousAsync(),
+                _ => return false,
+            };
+            return op.ok().and_then(|o| o.get().ok()).unwrap_or(false);
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = method;
         false
