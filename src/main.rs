@@ -226,6 +226,8 @@ fn main() {
         }
         malloc_trim(0);
     }
+    #[cfg(target_os = "windows")]
+    win32_window::trim_working_set();
 
     let mut pixmap = Pixmap::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32)
         .expect("Failed to allocate Pixmap");
@@ -260,8 +262,17 @@ fn main() {
     let mut hitmap = UiHitMap::default();
     let mut events: Vec<WindowEvent> = Vec::with_capacity(32);
 
+    let monitor_hz = win.refresh_rate_hz().clamp(60, 120);
+    let startup_at = Instant::now();
+    #[cfg(target_os = "windows")]
+    let mut post_init_trimmed = false;
+    #[cfg(target_os = "linux")]
+    let mut startup_resync_stage: u8 = 0;
     let mut last_tick = Instant::now();
     let mut last_sec_tick = Instant::now();
+    let mut last_present_at = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
     let mut hover_expand_at: Option<Instant> = None;
     let mut leave_collapse_at: Option<Instant> = None;
     let mut sample_notif_idx: usize = 0;
@@ -273,6 +284,35 @@ fn main() {
         let now = Instant::now();
         let dt = now.duration_since(last_tick).as_secs_f64().clamp(0.001, 0.033);
         last_tick = now;
+        let mut urgent_redraw = false;
+
+        #[cfg(target_os = "windows")]
+        if !post_init_trimmed && startup_at.elapsed() >= Duration::from_secs(3) {
+            post_init_trimmed = true;
+            win32_window::trim_working_set();
+        }
+
+        // On Linux (especially GNOME Wayland/XWayland autostart), re-sync monitor geometry,
+        // map_window, StackMode::ABOVE and repaint after the desktop shell finishes initializing.
+        #[cfg(target_os = "linux")]
+        if startup_resync_stage < 3 {
+            let next_ms = match startup_resync_stage {
+                0 => 1500,
+                1 => 4500,
+                _ => 9000,
+            };
+            if startup_at.elapsed() >= Duration::from_millis(next_ms) {
+                startup_resync_stage += 1;
+                win.sync_monitor_and_raise();
+                let iw = ctx.cur_w.round() as i32 + 8;
+                let ih = ctx.cur_h.round() as i32 + 6;
+                ctx.last_input_w = iw;
+                ctx.last_input_h = ih;
+                win.set_input_region(iw, ih);
+                needs_redraw = true;
+                urgent_redraw = true;
+            }
+        }
 
         // 0. Drain async file picker & online prayer search results
         if let Ok(mut picked) = pending_picked_files.try_lock() {
@@ -313,11 +353,24 @@ fn main() {
             }
         }
 
-        // 1. Drain X11 Events
+        // 1. Drain Window Events
         win.drain_events(&mut events);
         for ev in events.drain(..) {
             match ev {
-                WindowEvent::Expose => needs_redraw = true,
+                WindowEvent::Expose => {
+                    needs_redraw = true;
+                    urgent_redraw = true;
+                }
+                WindowEvent::MonitorChanged => {
+                    win.sync_monitor_and_raise();
+                    let iw = ctx.cur_w.round() as i32 + 8;
+                    let ih = ctx.cur_h.round() as i32 + 6;
+                    ctx.last_input_w = iw;
+                    ctx.last_input_h = ih;
+                    win.set_input_region(iw, ih);
+                    needs_redraw = true;
+                    urgent_redraw = true;
+                }
                 WindowEvent::PointerEnter(x, y) => {
                     ctx.is_hovered = true;
                     ctx.hover_x = x as f32;
@@ -328,6 +381,7 @@ fn main() {
                         hover_expand_at = Some(now);
                     }
                     needs_redraw = true;
+                    urgent_redraw = true;
                 }
                 WindowEvent::PointerLeave => {
                     ctx.is_hovered = false;
@@ -344,6 +398,7 @@ fn main() {
                         leave_collapse_at = Some(now);
                     }
                     needs_redraw = true;
+                    urgent_redraw = true;
                 }
                 WindowEvent::PointerMove(x, y) => {
                     let fx = x as f32;
@@ -371,10 +426,12 @@ fn main() {
                         ctx.interp_pos_sec = frac as f64 * ctx.cached_media.length_secs as f64;
                         needs_redraw = true;
                     } else if ctx.expanded {
+                        // Coalesced to display frame rate (prevents 500-1000Hz mouse DWM stutter on Windows)
                         needs_redraw = true;
                     }
                 }
                 WindowEvent::ButtonDown(btn, x, y) => {
+                    urgent_redraw = true;
                     let fx = x as f32;
                     let fy = y as f32;
                     ctx.hover_x = fx;
@@ -866,6 +923,7 @@ fn main() {
                     }
                 }
                 WindowEvent::ButtonUp(1) => {
+                    urgent_redraw = true;
                     let was_dragging = ctx.vol_osd_dragging || ctx.media_seek_dragging;
                     if ctx.vol_osd_dragging {
                         ctx.vol_osd_dragging = false;
@@ -894,6 +952,7 @@ fn main() {
                 }
                 WindowEvent::ButtonUp(_) => {}
                 WindowEvent::KeyChar(ch) => {
+                    urgent_redraw = true;
                     match ctx.focused_input {
                         Some(InputField::Todo) => {
                             if ctx.todo_draft.len() < 120 {
@@ -913,6 +972,7 @@ fn main() {
                     }
                 }
                 WindowEvent::KeyBackspace => {
+                    urgent_redraw = true;
                     match ctx.focused_input {
                         Some(InputField::Todo) => {
                             ctx.todo_draft.pop();
@@ -926,6 +986,7 @@ fn main() {
                     }
                 }
                 WindowEvent::KeyEnter => {
+                    urgent_redraw = true;
                     match ctx.focused_input {
                         Some(InputField::Todo) => {
                             submit_todo(&mut ctx);
@@ -939,6 +1000,7 @@ fn main() {
                     }
                 }
                 WindowEvent::KeyEscape => {
+                    urgent_redraw = true;
                     if ctx.focused_input.is_some() {
                         ctx.focused_input = None;
                         if !ctx.is_hovered
@@ -1124,8 +1186,16 @@ fn main() {
                     || ctx.cached_media.artist != new_m.artist;
                 let play_changed = ctx.cached_media.playing != new_m.playing;
 
+                let missing_timeline = new_m.playing
+                    && !track_changed
+                    && !play_changed
+                    && !new_m.timeline_live
+                    && new_m.position_f64 <= 0.001
+                    && ctx.interp_pos_sec > 0.5;
+
                 if track_changed
-                    || (!ctx.media_seek_dragging
+                    || (!missing_timeline
+                        && !ctx.media_seek_dragging
                         && !recently_seeked
                         && ((ctx.interp_pos_sec - new_m.position_f64).abs() > 0.85
                             || play_changed
@@ -1270,11 +1340,12 @@ fn main() {
         let is_playing = ctx.cached_media.has_player && ctx.cached_media.playing;
         if is_playing || (ctx.cached_media.has_player && (ctx.media_seek_dragging || recently_seeked)) {
             if is_playing && !ctx.media_seek_dragging {
+                let rate = ctx.cached_media.playback_rate.clamp(0.25, 4.0);
                 let max_len = ctx.cached_media.length_secs as f64;
                 if max_len > 0.5 {
-                    ctx.interp_pos_sec = (ctx.interp_pos_sec + dt).min(max_len);
+                    ctx.interp_pos_sec = (ctx.interp_pos_sec + dt * rate).min(max_len);
                 } else {
-                    ctx.interp_pos_sec += dt;
+                    ctx.interp_pos_sec += dt * rate;
                 }
                 ctx.wave_phase += dt * 5.8;
             }
@@ -1457,14 +1528,7 @@ fn main() {
             win.set_input_region(iw, ih);
         }
 
-        // 8. Render & Blit
-        if needs_redraw {
-            let active_h = render_island(&mut pixmap, &mut fonts, &ctx, &mut hitmap);
-            win.present(&mut pixmap, active_h);
-            needs_redraw = false;
-        }
-
-        // 9. Adaptive sleep: silky 60 FPS when active, 0% CPU when idle!
+        // 8. Frame-Paced Render & Blit (60..120 FPS adaptive, coalescing high-Hz mouse moves)
         let active_anim = animating_spring
             || is_playing
             || ctx.vol_osd_remaining > 0.0
@@ -1474,7 +1538,42 @@ fn main() {
             || hover_expand_at.is_some()
             || leave_collapse_at.is_some()
             || ctx.focused_input.is_some();
-        let sleep_ms = if active_anim { 16 } else { 250 };
-        win.wait_events(sleep_ms);
+
+        let target_fps = if animating_spring
+            || ctx.vol_osd_remaining > 0.0
+            || ctx.notif_toast_remaining > 0.0
+            || ctx.lyric_anim_prog < 1.0
+            || ctx.media_lyric_anim_prog < 1.0
+        {
+            monitor_hz
+        } else {
+            60
+        };
+        let frame_budget = Duration::from_micros(1_000_000 / target_fps as u64);
+        let since_present = now.duration_since(last_present_at);
+
+        if needs_redraw
+            && (urgent_redraw || since_present + Duration::from_micros(500) >= frame_budget)
+        {
+            let active_h = render_island(&mut pixmap, &mut fonts, &ctx, &mut hitmap);
+            win.present(&mut pixmap, active_h);
+            last_present_at = now;
+            needs_redraw = false;
+        }
+
+        // 9. Adaptive high-resolution sleep: exact frame pacing when active, 0% CPU when idle
+        let wait_us: u64 = if needs_redraw {
+            frame_budget
+                .saturating_sub(last_present_at.elapsed())
+                .as_micros() as u64
+        } else if active_anim {
+            frame_budget
+                .saturating_sub(last_present_at.elapsed())
+                .as_micros()
+                .max(1000) as u64
+        } else {
+            250_000
+        };
+        win.wait_events_us(wait_us);
     }
 }

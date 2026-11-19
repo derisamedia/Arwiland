@@ -25,8 +25,11 @@ if [ -f "./target/release/arwiland" ]; then
         cp -f "./assets/arwiland.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/arwiland.svg" 2>/dev/null || true
     fi
     if [ -f "./assets/arwiland.desktop" ]; then
-        cp -f "./assets/arwiland.desktop" "$HOME/.local/share/applications/arwiland.desktop" 2>/dev/null || true
-        cp -f "./assets/arwiland.desktop" "$HOME/.config/autostart/arwiland.desktop" 2>/dev/null || true
+        sed "s|^Exec=.*|Exec=env MALLOC_ARENA_MAX=2 $HOME/.local/bin/arwiland|" "./assets/arwiland.desktop" > "$HOME/.local/share/applications/arwiland.desktop" 2>/dev/null || true
+        if [ -f "$HOME/.config/autostart/arwiland.desktop" ]; then
+            cp -f "$HOME/.local/share/applications/arwiland.desktop" "$HOME/.config/autostart/arwiland.desktop" 2>/dev/null || true
+            printf 'X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=3\n' >> "$HOME/.config/autostart/arwiland.desktop" 2>/dev/null || true
+        fi
     fi
     BIN="./target/release/arwiland"
 elif [ -f "./target/debug/arwiland" ]; then

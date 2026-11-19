@@ -157,7 +157,30 @@ fn apply_platform_mute_toggle() {
 }
 
 #[cfg(target_os = "windows")]
-fn win_audio_endpoint() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume> {
+struct WinAudioCache {
+    com_init: bool,
+    enumerator: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator>,
+    endpoint: Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume>,
+    last_refresh: Option<Instant>,
+}
+
+#[cfg(target_os = "windows")]
+thread_local! {
+    static WIN_AUDIO: std::cell::RefCell<WinAudioCache> = const {
+        std::cell::RefCell::new(WinAudioCache {
+            com_init: false,
+            enumerator: None,
+            endpoint: None,
+            last_refresh: None,
+        })
+    };
+}
+
+#[cfg(target_os = "windows")]
+fn win_with_audio_endpoint<T, F>(force_refresh: bool, f: F) -> Option<T>
+where
+    F: Fn(&windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume) -> Result<T, ()>,
+{
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::Media::Audio::{
         eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -165,26 +188,58 @@ fn win_audio_endpoint() -> Option<windows::Win32::Media::Audio::Endpoints::IAudi
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)
-            .ok()?;
-        device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()
-    }
+
+    let acquire = |cache: &mut WinAudioCache| -> Option<IAudioEndpointVolume> {
+        unsafe {
+            if !cache.com_init {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                cache.com_init = true;
+            }
+            if cache.enumerator.is_none() {
+                cache.enumerator =
+                    CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                        .ok();
+            }
+            let enumerator = cache.enumerator.as_ref()?;
+            let device = enumerator
+                .GetDefaultAudioEndpoint(eRender, eMultimedia)
+                .ok()?;
+            let ep = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()?;
+            cache.endpoint = Some(ep.clone());
+            cache.last_refresh = Some(Instant::now());
+            Some(ep)
+        }
+    };
+
+    WIN_AUDIO.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let stale = force_refresh
+            || cache.endpoint.is_none()
+            || cache
+                .last_refresh
+                .map(|t| t.elapsed() >= Duration::from_secs(3))
+                .unwrap_or(true);
+        let ep = if stale {
+            acquire(&mut cache)?
+        } else {
+            cache.endpoint.clone()?
+        };
+        if let Ok(val) = f(&ep) {
+            return Some(val);
+        }
+        // Device likely invalidated (e.g. headphones unplugged); re-acquire once
+        cache.endpoint = None;
+        let fresh = acquire(&mut cache)?;
+        f(&fresh).ok()
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn apply_platform_mute_toggle() {
-    if let Some(ep) = win_audio_endpoint() {
-        unsafe {
-            if let Ok(cur) = ep.GetMute() {
-                let _ = ep.SetMute(!cur.as_bool(), std::ptr::null());
-            }
-        }
-    }
+    let _ = win_with_audio_endpoint(false, |ep| unsafe {
+        let cur = ep.GetMute().map_err(|_| ())?;
+        ep.SetMute(!cur.as_bool(), std::ptr::null()).map_err(|_| ())
+    });
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -206,13 +261,13 @@ fn apply_platform_volume(vol: u32) {
 
 #[cfg(target_os = "windows")]
 fn apply_platform_volume(vol: u32) {
-    if let Some(ep) = win_audio_endpoint() {
-        let scalar = (vol.min(100) as f32) / 100.0;
-        unsafe {
-            let _ = ep.SetMasterVolumeLevelScalar(scalar, std::ptr::null());
-            let _ = ep.SetMute(false, std::ptr::null());
-        }
-    }
+    let scalar = (vol.min(100) as f32) / 100.0;
+    let _ = win_with_audio_endpoint(false, |ep| unsafe {
+        ep.SetMasterVolumeLevelScalar(scalar, std::ptr::null())
+            .map_err(|_| ())?;
+        let _ = ep.SetMute(false, std::ptr::null());
+        Ok(())
+    });
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -259,13 +314,12 @@ fn query_platform_volume() -> Option<(u32, bool)> {
 
 #[cfg(target_os = "windows")]
 fn query_platform_volume() -> Option<(u32, bool)> {
-    let ep = win_audio_endpoint()?;
-    unsafe {
-        let scalar = ep.GetMasterVolumeLevelScalar().ok()?;
-        let muted = ep.GetMute().ok()?.as_bool();
+    win_with_audio_endpoint(false, |ep| unsafe {
+        let scalar = ep.GetMasterVolumeLevelScalar().map_err(|_| ())?;
+        let muted = ep.GetMute().map_err(|_| ())?.as_bool();
         let pct = (scalar * 100.0).round().clamp(0.0, 100.0) as u32;
-        Some((pct, muted))
-    }
+        Ok((pct, muted))
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

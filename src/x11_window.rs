@@ -1,4 +1,6 @@
 use std::os::unix::io::AsRawFd;
+use std::thread;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr;
 use x11rb::protocol::shape::{self, SK, SO};
@@ -14,6 +16,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 #[derive(Debug, Clone, Copy)]
 pub enum WindowEvent {
     Expose,
+    MonitorChanged,
     PointerEnter(i16, i16),
     PointerLeave,
     PointerMove(i16, i16),
@@ -40,15 +43,75 @@ pub struct X11OverlayWindow {
     keysyms: Vec<u32>,
 }
 
+fn connect_x11_with_retry() -> Result<(RustConnection, usize), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match RustConnection::connect(None) {
+            Ok(pair) => return Ok(pair),
+            Err(e) => {
+                // On some Wayland/autostart sessions DISPLAY may not be exported yet; try :0 / :1
+                for fallback in [":0", ":1"] {
+                    if let Ok(pair) = RustConnection::connect(Some(fallback)) {
+                        return Ok(pair);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("X11 connect failed: {e}"));
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn is_compositor_and_wm_ready(conn: &RustConnection, screen_num: usize, root: u32) -> bool {
+    let cm_name = format!("_NET_WM_CM_S{}", screen_num);
+    let has_cm = intern(conn, cm_name.as_bytes())
+        .and_then(|atom| conn.get_selection_owner(atom).ok())
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.owner != 0)
+        .unwrap_or(false);
+
+    let has_wm = intern(conn, b"_NET_SUPPORTING_WM_CHECK")
+        .and_then(|atom| {
+            conn.get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+                .ok()
+        })
+        .and_then(|c| c.reply().ok())
+        .map(|r| !r.value.is_empty())
+        .unwrap_or(false);
+
+    has_cm && has_wm
+}
+
+fn wait_for_desktop_ready(conn: &RustConnection, screen_num: usize, root: u32) {
+    if is_compositor_and_wm_ready(conn, screen_num, root) {
+        return;
+    }
+    // We caught the session mid-login (e.g. systemd-xdg-autostart before Mutter/XWayland or picom is ready).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        if is_compositor_and_wm_ready(conn, screen_num, root) {
+            // Brief settle time so GNOME Shell / panel finishes its initial mapping before we map on top
+            thread::sleep(Duration::from_millis(600));
+            return;
+        }
+    }
+}
+
 impl X11OverlayWindow {
     pub fn new(width: u16, height: u16, is_bottom: bool, y_offset: i32) -> Result<Self, String> {
-        let (conn, screen_num) =
-            RustConnection::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
+        let (conn, screen_num) = connect_x11_with_retry()?;
         let setup = conn.setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
         let screen = &setup.roots[screen_num];
         let root = screen.root;
+
+        // Wait for WM + X11/XWayland compositor on early login startup so the 32-bit ARGB
+        // override_redirect overlay isn't dropped or hidden behind the desktop shell.
+        wait_for_desktop_ready(&conn, screen_num, root);
 
         let argb_visual = screen
             .allowed_depths
@@ -87,7 +150,8 @@ impl X11OverlayWindow {
             | EventMask::BUTTON_RELEASE
             | EventMask::ENTER_WINDOW
             | EventMask::LEAVE_WINDOW
-            | EventMask::KEY_PRESS;
+            | EventMask::KEY_PRESS
+            | EventMask::STRUCTURE_NOTIFY;
 
         let aux = CreateWindowAux::new()
             .background_pixel(0)
@@ -110,6 +174,15 @@ impl X11OverlayWindow {
             &aux,
         )
         .map_err(|e| format!("create_window failed: {e}"))?;
+
+        // Subscribe to RandR monitor layout/scaling changes (common right after GNOME/KDE login)
+        let _ = randr::select_input(
+            &conn,
+            root,
+            randr::NotifyMask::SCREEN_CHANGE
+                | randr::NotifyMask::OUTPUT_CHANGE
+                | randr::NotifyMask::CRTC_CHANGE,
+        );
 
         set_ewmh_overlay_hints(&conn, win);
 
@@ -170,6 +243,31 @@ impl X11OverlayWindow {
         } else {
             mon_y + y_off
         };
+        let _ = self.conn.configure_window(
+            self.win,
+            &ConfigureWindowAux::new()
+                .x(win_x)
+                .y(win_y)
+                .stack_mode(StackMode::ABOVE),
+        );
+        let _ = self.conn.flush();
+    }
+
+    /// Re-syncs primary monitor geometry, ensures the overlay window is mapped & stacked ABOVE,
+    /// and forces a full repaint on the next present (rescues early-login XWayland/WM races).
+    pub fn sync_monitor_and_raise(&mut self) {
+        self.prev_blit_h = self.height;
+        let screen = &self.conn.setup().roots[self.screen_num];
+        let root = screen.root;
+        let (mon_x, mon_y, mon_w, mon_h) = detect_primary_monitor(&self.conn, root, screen);
+        let win_x = mon_x + ((mon_w - self.width as i32) / 2).max(0);
+        let win_y = if self.is_bottom {
+            mon_y + mon_h - self.height as i32 - self.y_offset
+        } else {
+            mon_y + self.y_offset
+        };
+        set_ewmh_overlay_hints(&self.conn, self.win);
+        let _ = self.conn.map_window(self.win);
         let _ = self.conn.configure_window(
             self.win,
             &ConfigureWindowAux::new()
@@ -274,6 +372,18 @@ impl X11OverlayWindow {
         let _ = self.conn.flush();
     }
 
+    pub fn refresh_rate_hz(&self) -> u32 {
+        60
+    }
+
+    pub fn wait_events_us(&self, timeout_us: u64) {
+        if timeout_us == 0 {
+            return;
+        }
+        let timeout_ms = ((timeout_us + 500) / 1000).max(1).min(i32::MAX as u64) as i32;
+        self.wait_events(timeout_ms);
+    }
+
     pub fn wait_events(&self, timeout_ms: i32) {
         let fd = self.conn.stream().as_raw_fd();
         let mut pfd = libc::pollfd {
@@ -335,7 +445,10 @@ impl X11OverlayWindow {
         out.clear();
         while let Ok(Some(ev)) = self.conn.poll_for_event() {
             match ev {
-                Event::Expose(_) => out.push(WindowEvent::Expose),
+                Event::Expose(_) | Event::MapNotify(_) => out.push(WindowEvent::Expose),
+                Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                    out.push(WindowEvent::MonitorChanged);
+                }
                 Event::EnterNotify(e) => out.push(WindowEvent::PointerEnter(e.event_x, e.event_y)),
                 Event::LeaveNotify(_) => out.push(WindowEvent::PointerLeave),
                 Event::MotionNotify(e) => out.push(WindowEvent::PointerMove(e.event_x, e.event_y)),

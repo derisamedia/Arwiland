@@ -5,15 +5,21 @@ use std::path::PathBuf;
 use std::ptr;
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetMonitorInfoW,
-    MonitorFromPoint, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTOPRIMARY,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplaySettingsW,
+    GetMonitorInfoW, MonitorFromPoint, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DEVMODEW, DIB_RGB_COLORS, ENUM_CURRENT_SETTINGS,
+    HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, GetCurrentProcess, SetProcessWorkingSetSize, SetWaitableTimer,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
@@ -29,17 +35,20 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
     LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, MB_ICONASTERISK, MSG, MWMO_INPUTAVAILABLE,
-    PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW,
+    MB_ICONASTERISK, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WM_CHAR,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 #[derive(Debug, Clone, Copy)]
 pub enum WindowEvent {
     Expose,
+    #[allow(dead_code)]
+    MonitorChanged,
     PointerEnter(i16, i16),
     PointerLeave,
     PointerMove(i16, i16),
@@ -63,12 +72,16 @@ pub struct Win32OverlayWindow {
     old_obj: HGDIOBJ,
     dib_bits: *mut u8,
     state_ptr: *mut WndState,
+    frame_timer: HANDLE,
     pub width: u16,
     pub height: u16,
     win_x: i32,
     win_y: i32,
     is_bottom: bool,
     y_offset: i32,
+    prev_blit_h: u16,
+    full_present_needed: bool,
+    refresh_hz: u32,
 }
 
 fn get_x_lparam(lp: LPARAM) -> i16 {
@@ -92,6 +105,19 @@ fn primary_monitor_rect() -> (i32, i32, i32, i32) {
         }
     }
     (0, 0, 1920, 1080)
+}
+
+fn primary_monitor_refresh_hz() -> u32 {
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
+            && dm.dmDisplayFrequency >= 30
+        {
+            return dm.dmDisplayFrequency.clamp(60, 120);
+        }
+    }
+    60
 }
 
 unsafe extern "system" fn wndproc(
@@ -275,6 +301,17 @@ impl Win32OverlayWindow {
             let old_obj = SelectObject(hdc_mem, hbmp);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+            let frame_timer = CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+            .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0))
+            .unwrap_or_default();
+
+            let refresh_hz = primary_monitor_refresh_hz();
+
             Ok(Self {
                 hwnd,
                 hdc_mem,
@@ -282,20 +319,35 @@ impl Win32OverlayWindow {
                 old_obj,
                 dib_bits: bits as *mut u8,
                 state_ptr,
+                frame_timer,
                 width,
                 height,
                 win_x,
                 win_y,
                 is_bottom,
                 y_offset: y_off,
+                prev_blit_h: height,
+                full_present_needed: true,
+                refresh_hz,
             })
         }
+    }
+
+    pub fn refresh_rate_hz(&self) -> u32 {
+        self.refresh_hz
+    }
+
+    #[allow(dead_code)]
+    pub fn sync_monitor_and_raise(&mut self) {
+        self.set_position(self.is_bottom, self.y_offset);
     }
 
     pub fn set_position(&mut self, is_bottom: bool, y_offset: i32) {
         let y_off = y_offset.clamp(0, 64);
         self.is_bottom = is_bottom;
         self.y_offset = y_off;
+        self.prev_blit_h = self.height;
+        self.full_present_needed = true;
         let (mon_x, mon_y, mon_w, mon_h) = primary_monitor_rect();
         self.win_x = mon_x + ((mon_w - self.width as i32) / 2).max(0);
         self.win_y = if is_bottom {
@@ -340,20 +392,42 @@ impl Win32OverlayWindow {
         }
     }
 
-    /// Copies premultiplied RGBA -> premultiplied BGRA into the persistent DIB and updates the layered window.
-    pub fn present(&mut self, pixmap: &mut tiny_skia::Pixmap, _active_h: u16) {
+    /// Copies premultiplied RGBA -> premultiplied BGRA only for dirty rows and uploads via UpdateLayeredWindowIndirect.
+    pub fn present(&mut self, pixmap: &mut tiny_skia::Pixmap, active_h: u16) {
         let src = pixmap.data();
-        let total = (self.width as usize) * (self.height as usize) * 4;
+        let row_bytes = (self.width as usize) * 4;
+        let total = row_bytes * (self.height as usize);
         if src.len() < total || self.dib_bits.is_null() {
             return;
         }
+
+        let clamped_active = active_h.min(self.height).max(1);
+        let blit_h = if self.full_present_needed {
+            self.height
+        } else {
+            clamped_active.max(self.prev_blit_h).min(self.height)
+        };
+        self.prev_blit_h = clamped_active;
+
+        let (y_start, y_end) = if self.is_bottom {
+            (self.height.saturating_sub(blit_h), self.height)
+        } else {
+            (0, blit_h)
+        };
+        let byte_start = y_start as usize * row_bytes;
+        let byte_end = y_end as usize * row_bytes;
+
         unsafe {
             let dst = std::slice::from_raw_parts_mut(self.dib_bits, total);
-            for (s, d) in src[..total].chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-                d[0] = s[2]; // B
-                d[1] = s[1]; // G
-                d[2] = s[0]; // R
-                d[3] = s[3]; // A
+            for (s, d) in src[byte_start..byte_end]
+                .chunks_exact(4)
+                .zip(dst[byte_start..byte_end].chunks_exact_mut(4))
+            {
+                let px = u32::from_ne_bytes([s[0], s[1], s[2], s[3]]);
+                let bgra = (px & 0xFF00_FF00)
+                    | ((px & 0x00FF_0000) >> 16)
+                    | ((px & 0x0000_00FF) << 16);
+                d.copy_from_slice(&bgra.to_ne_bytes());
             }
 
             let pt_dst = POINT {
@@ -371,29 +445,76 @@ impl Win32OverlayWindow {
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-            let _ = UpdateLayeredWindow(
-                self.hwnd,
-                HDC::default(),
-                Some(&pt_dst),
-                Some(&size),
-                self.hdc_mem,
-                Some(&pt_src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            let dirty = RECT {
+                left: 0,
+                top: y_start as i32,
+                right: self.width as i32,
+                bottom: y_end as i32,
+            };
+            let info = UPDATELAYEREDWINDOWINFO {
+                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                hdcDst: HDC::default(),
+                pptDst: &pt_dst,
+                psize: &size,
+                hdcSrc: self.hdc_mem,
+                pptSrc: &pt_src,
+                crKey: COLORREF(0),
+                pblend: &blend,
+                dwFlags: ULW_ALPHA,
+                prcDirty: if self.full_present_needed {
+                    ptr::null()
+                } else {
+                    &dirty
+                },
+            };
+            if !UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool() {
+                let _ = UpdateLayeredWindow(
+                    self.hwnd,
+                    HDC::default(),
+                    Some(&pt_dst),
+                    Some(&size),
+                    self.hdc_mem,
+                    Some(&pt_src),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+            }
+            self.full_present_needed = false;
         }
     }
 
-    pub fn wait_events(&self, timeout_ms: i32) {
+    pub fn wait_events_us(&self, timeout_us: u64) {
+        if timeout_us == 0 {
+            return;
+        }
         unsafe {
+            if !self.frame_timer.is_invalid() {
+                let due_time: i64 = -((timeout_us as i64).saturating_mul(10));
+                if SetWaitableTimer(self.frame_timer, &due_time, 0, None, None, false).is_ok() {
+                    let handles = [self.frame_timer];
+                    let _ = MsgWaitForMultipleObjectsEx(
+                        Some(&handles),
+                        INFINITE,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE,
+                    );
+                    return;
+                }
+            }
+            let timeout_ms = ((timeout_us + 999) / 1000).min(u32::MAX as u64) as u32;
             let _ = MsgWaitForMultipleObjectsEx(
                 None,
-                timeout_ms.max(0) as u32,
+                timeout_ms,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             );
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn wait_events(&self, timeout_ms: i32) {
+        self.wait_events_us((timeout_ms.max(0) as u64) * 1000);
     }
 
     pub fn drain_events(&self, out: &mut Vec<WindowEvent>) {
@@ -415,6 +536,9 @@ impl Win32OverlayWindow {
 impl Drop for Win32OverlayWindow {
     fn drop(&mut self) {
         unsafe {
+            if !self.frame_timer.is_invalid() {
+                let _ = CloseHandle(self.frame_timer);
+            }
             if !self.hdc_mem.is_invalid() {
                 SelectObject(self.hdc_mem, self.old_obj);
                 let _ = DeleteObject(self.hbmp);
@@ -429,6 +553,12 @@ impl Drop for Win32OverlayWindow {
                 self.state_ptr = ptr::null_mut();
             }
         }
+    }
+}
+
+pub fn trim_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 

@@ -363,6 +363,12 @@ impl NotificationHub {
 
     #[cfg(target_os = "windows")]
     fn spawn_dbus_listener(&self) {
+        // UserNotificationListener requires Windows Package Identity (MSIX/Sparse Package).
+        // Calling it from an unpackaged Win32 .exe loads ~10-15 MB of WinRT notification DLLs
+        // only to return empty lists, so check package identity via kernel32 first.
+        if !win_has_package_identity() {
+            return;
+        }
         let hub = self.clone();
         thread::spawn(move || {
             use std::collections::HashSet;
@@ -455,6 +461,28 @@ impl NotificationHub {
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn spawn_dbus_listener(&self) {}
+}
+
+#[cfg(target_os = "windows")]
+fn win_has_package_identity() -> bool {
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    type GetCurrentPackageFullNameFn = unsafe extern "system" fn(*mut u32, *mut u16) -> i32;
+    const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
+
+    unsafe {
+        let Ok(hmod) = GetModuleHandleW(w!("kernel32.dll")) else {
+            return false;
+        };
+        let Some(proc_addr) = GetProcAddress(hmod, s!("GetCurrentPackageFullName")) else {
+            return false;
+        };
+        let func: GetCurrentPackageFullNameFn = std::mem::transmute(proc_addr);
+        let mut len: u32 = 0;
+        let rc = func(&mut len, std::ptr::null_mut());
+        rc != APPMODEL_ERROR_NO_PACKAGE
+    }
 }
 
 #[cfg(target_os = "linux")]

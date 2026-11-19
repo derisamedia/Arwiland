@@ -44,7 +44,7 @@ fn reset_session_bus() {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MediaStatus {
     pub active_bus: Option<String>,
     pub track_id: Option<String>,
@@ -54,9 +54,31 @@ pub struct MediaStatus {
     pub artist: String,
     pub art_path: Option<String>,
     pub playing: bool,
+    pub playback_rate: f64,
+    pub timeline_live: bool,
     pub position_secs: u64,
     pub position_f64: f64,
     pub length_secs: u64,
+}
+
+impl Default for MediaStatus {
+    fn default() -> Self {
+        Self {
+            active_bus: None,
+            track_id: None,
+            has_player: false,
+            player_name: String::new(),
+            title: String::new(),
+            artist: String::new(),
+            art_path: None,
+            playing: false,
+            playback_rate: 1.0,
+            timeline_live: false,
+            position_secs: 0,
+            position_f64: 0.0,
+            length_secs: 0,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -182,14 +204,39 @@ fn win_format_app_name(aumid: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn win_pick_session() -> Option<GlobalSystemMediaTransportControlsSession> {
+thread_local! {
+    static WIN_SMTC_MGR: std::cell::RefCell<Option<GlobalSystemMediaTransportControlsSessionManager>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "windows")]
+fn win_get_session_manager() -> Option<GlobalSystemMediaTransportControlsSessionManager> {
     win_ensure_com();
-    let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .ok()?
-        .get()
-        .ok()?;
-    let mut fallback = mgr.GetCurrentSession().ok();
-    if let Ok(list) = mgr.GetSessions() {
+    WIN_SMTC_MGR.with(|cell| {
+        if let Some(ref mgr) = *cell.borrow() {
+            return Some(mgr.clone());
+        }
+        let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .ok()?
+            .get()
+            .ok()?;
+        *cell.borrow_mut() = Some(mgr.clone());
+        Some(mgr)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn win_reset_session_manager() {
+    WIN_SMTC_MGR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn win_pick_session() -> Option<GlobalSystemMediaTransportControlsSession> {
+    let pick_from = |mgr: &GlobalSystemMediaTransportControlsSessionManager| -> Result<Option<GlobalSystemMediaTransportControlsSession>, ()> {
+        let list = mgr.GetSessions().map_err(|_| ())?;
+        let mut fallback = mgr.GetCurrentSession().ok();
         let count = list.Size().unwrap_or(0);
         for i in 0..count {
             if let Ok(sess) = list.GetAt(i) {
@@ -200,15 +247,29 @@ fn win_pick_session() -> Option<GlobalSystemMediaTransportControlsSession> {
                     .map(|st| st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
                     .unwrap_or(false);
                 if is_playing {
-                    return Some(sess);
+                    return Ok(Some(sess));
                 }
                 if fallback.is_none() {
                     fallback = Some(sess);
                 }
             }
         }
+        Ok(fallback)
+    };
+
+    if let Some(mgr) = win_get_session_manager() {
+        if let Ok(res) = pick_from(&mgr) {
+            return res;
+        }
+        // Manager proxy became stale (e.g. SMTC service restart); refresh once
+        win_reset_session_manager();
+        if let Some(fresh) = win_get_session_manager() {
+            if let Ok(res) = pick_from(&fresh) {
+                return res;
+            }
+        }
     }
-    fallback
+    None
 }
 
 #[allow(dead_code)]
@@ -339,6 +400,8 @@ pub fn query_media_status() -> MediaStatus {
                     artist,
                     art_path,
                     playing,
+                    playback_rate: 1.0,
+                    timeline_live: true,
                     position_secs: pos_us / 1_000_000,
                     position_f64: pos_us as f64 / 1_000_000.0,
                     length_secs: len_us / 1_000_000,
@@ -394,6 +457,8 @@ pub fn query_media_status() -> MediaStatus {
                     artist: parts[3].to_string(),
                     art_path: None,
                     playing,
+                    playback_rate: 1.0,
+                    timeline_live: true,
                     position_secs: pos_f.max(0.0) as u64,
                     position_f64: pos_f.max(0.0),
                     length_secs: len_f.max(0.0) as u64,
@@ -410,12 +475,18 @@ pub fn query_media_status() -> MediaStatus {
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_else(|_| "Media".to_string());
             let player_name = win_format_app_name(&aumid);
-            let playing = sess
-                .GetPlaybackInfo()
-                .ok()
+            let playback_info = sess.GetPlaybackInfo().ok();
+            let playing = playback_info
+                .as_ref()
                 .and_then(|pi| pi.PlaybackStatus().ok())
                 .map(|st| st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
                 .unwrap_or(false);
+            let playback_rate = playback_info
+                .as_ref()
+                .and_then(|pi| pi.PlaybackRate().ok())
+                .and_then(|r| r.Value().ok())
+                .filter(|&r| r.is_finite() && r > 0.05 && r <= 4.0)
+                .unwrap_or(1.0);
 
             let (title, artist) = sess
                 .TryGetMediaPropertiesAsync()
@@ -445,37 +516,42 @@ pub fn query_media_status() -> MediaStatus {
                 })
                 .unwrap_or_else(|| ("Media Aktif".to_string(), player_name.clone()));
 
-            let (pos_f64, len_secs) = sess
+            const UNIX_EPOCH_FILETIME_TICKS: i64 = 116_444_736_000_000_000;
+            let (pos_f64, len_secs, timeline_live) = sess
                 .GetTimelineProperties()
                 .ok()
                 .map(|tl| {
+                    let start_ticks = tl.StartTime().map(|d| d.Duration).unwrap_or(0).max(0);
                     let pos_ticks = tl.Position().map(|d| d.Duration).unwrap_or(0).max(0);
                     let end_ticks = tl.EndTime().map(|d| d.Duration).unwrap_or(0).max(0);
-                    let mut pos = pos_ticks as f64 / 10_000_000.0;
-                    let len = (end_ticks as f64 / 10_000_000.0).max(0.0);
-                    if playing {
-                        if let Ok(last_upd) = tl.LastUpdatedTime() {
-                            // Windows FILETIME epoch = 1601-01-01; Unix epoch delta = 11644473600s
-                            if last_upd.UniversalTime > 116_444_736_000_000_000 {
-                                let upd_unix_s = (last_upd.UniversalTime
-                                    - 116_444_736_000_000_000)
-                                    as f64
-                                    / 10_000_000.0;
-                                let now_unix_s = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs_f64())
-                                    .unwrap_or(upd_unix_s);
-                                let delta = (now_unix_s - upd_unix_s).clamp(0.0, 30.0);
-                                pos += delta;
-                                if len > 0.5 {
-                                    pos = pos.min(len);
-                                }
-                            }
+                    let mut pos = (pos_ticks - start_ticks).max(0) as f64 / 10_000_000.0;
+                    let len = (end_ticks - start_ticks).max(0) as f64 / 10_000_000.0;
+                    let last_upd_ticks = tl
+                        .LastUpdatedTime()
+                        .map(|t| t.UniversalTime)
+                        .unwrap_or(0);
+                    let has_upd = last_upd_ticks > UNIX_EPOCH_FILETIME_TICKS;
+                    if playing && has_upd {
+                        // Windows SMTC only refreshes Position/LastUpdatedTime on state changes
+                        // (play/pause/seek/track change), never every second; do NOT cap delta at 30s!
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        let now_ticks = UNIX_EPOCH_FILETIME_TICKS
+                            + (now_unix.as_secs() as i64) * 10_000_000
+                            + (now_unix.subsec_nanos() as i64) / 100;
+                        let raw_delta_s =
+                            ((now_ticks - last_upd_ticks).max(0) as f64) / 10_000_000.0;
+                        let max_delta = if len > 0.5 { len } else { 21_600.0 };
+                        pos += (raw_delta_s * playback_rate).min(max_delta);
+                        if len > 0.5 {
+                            pos = pos.min(len);
                         }
                     }
-                    (pos.max(0.0), len.round() as u64)
+                    let live = has_upd || pos_ticks > start_ticks;
+                    (pos.max(0.0), len.round() as u64, live)
                 })
-                .unwrap_or((0.0, 0));
+                .unwrap_or((0.0, 0, false));
 
             return MediaStatus {
                 active_bus: Some(aumid),
@@ -486,6 +562,8 @@ pub fn query_media_status() -> MediaStatus {
                 artist,
                 art_path: None,
                 playing,
+                playback_rate,
+                timeline_live,
                 position_secs: pos_f64 as u64,
                 position_f64: pos_f64,
                 length_secs: len_secs,
@@ -502,6 +580,8 @@ pub fn query_media_status() -> MediaStatus {
         artist: "Putar musik di Spotify, Chrome, atau VLC".to_string(),
         art_path: None,
         playing: false,
+        playback_rate: 1.0,
+        timeline_live: false,
         position_secs: 0,
         position_f64: 0.0,
         length_secs: 0,
@@ -589,7 +669,13 @@ pub fn seek_media_to(
     {
         let _ = (cached_bus, cached_track_id);
         if let Some(sess) = win_pick_session() {
-            let ticks = (target_secs.max(0.0) * 10_000_000.0).round() as i64;
+            let start_ticks = sess
+                .GetTimelineProperties()
+                .ok()
+                .and_then(|tl| tl.StartTime().ok())
+                .map(|d| d.Duration.max(0))
+                .unwrap_or(0);
+            let ticks = start_ticks + (target_secs.max(0.0) * 10_000_000.0).round() as i64;
             return sess
                 .TryChangePlaybackPositionAsync(ticks)
                 .ok()

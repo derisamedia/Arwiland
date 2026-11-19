@@ -174,6 +174,9 @@ impl LyricsManager {
         let mut guard = self.cache.lock().unwrap();
         match guard.get(&key) {
             None => {
+                if guard.len() >= 16 {
+                    guard.clear();
+                }
                 guard.insert(key.clone(), TrackLyricsState::Loading);
                 drop(guard);
 

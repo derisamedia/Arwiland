@@ -289,28 +289,26 @@ pub fn is_autostart_installed() -> bool {
 pub fn resolve_startup_exec_command() -> String {
     #[cfg(target_os = "linux")]
     {
+        let format_path = |p: &std::path::Path| -> String {
+            let s = p.to_string_lossy();
+            if s.contains(' ') {
+                format!("env MALLOC_ARENA_MAX=2 \"{}\"", s)
+            } else {
+                format!("env MALLOC_ARENA_MAX=2 {}", s)
+            }
+        };
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let local_bin = PathBuf::from(home)
             .join(".local")
             .join("bin")
             .join("arwiland");
         if local_bin.exists() {
-            return format!("\"{}\"", local_bin.to_string_lossy());
+            return format_path(&local_bin);
         }
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(project_root) = exe
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-            {
-                let run_script = project_root.join("run.sh");
-                if run_script.exists() {
-                    return format!("\"{}\"", run_script.to_string_lossy());
-                }
-            }
-            return format!("\"{}\"", exe.to_string_lossy());
+            return format_path(&exe);
         }
-        "arwiland".to_string()
+        "env MALLOC_ARENA_MAX=2 arwiland".to_string()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -364,7 +362,7 @@ pub fn set_autostart_enabled(enabled: bool) -> bool {
              Categories=Utility;GTK;\n\
              StartupNotify=false\n\
              X-GNOME-Autostart-enabled=true\n\
-             X-GNOME-Autostart-Delay=2\n",
+             X-GNOME-Autostart-Delay=3\n",
             exec_cmd
         );
 

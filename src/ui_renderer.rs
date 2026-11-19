@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 use fontdue::{Font, FontSettings, Metrics};
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -118,6 +119,7 @@ struct CachedGlyph {
     bitmap: Vec<u8>,
 }
 
+#[cfg(not(target_os = "windows"))]
 pub struct FontEngine {
     regular: Font,
     bold: Font,
@@ -127,12 +129,54 @@ pub struct FontEngine {
     gamma_lut: [f32; 256],
 }
 
+#[cfg(target_os = "windows")]
+pub struct FontEngine {
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    orig_font: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    hfonts: HashMap<(bool, u16), windows::Win32::Graphics::Gdi::HFONT>,
+    scratch_buf: Vec<u8>,
+    reg_cap_ratio: f32,
+    bold_cap_ratio: f32,
+    /// Key: (bold, size_half_px, subpixel_phase_0_or_1, char)
+    cache: HashMap<(bool, u16, u8, char), CachedGlyph>,
+    /// Precomputed gamma-compensated coverage LUT (0..=255 -> 0.0..=1.0) for silky-smooth light-on-dark AA
+    gamma_lut: [f32; 256],
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for FontEngine {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
+        unsafe {
+            if !self.hdc.is_invalid() {
+                if !self.orig_font.is_invalid() {
+                    SelectObject(self.hdc, self.orig_font);
+                }
+                for (_, hf) in self.hfonts.drain() {
+                    if !hf.is_invalid() {
+                        let _ = DeleteObject(hf);
+                    }
+                }
+                let _ = DeleteDC(self.hdc);
+            }
+        }
+    }
+}
+
+fn build_gamma_lut() -> [f32; 256] {
+    let mut gamma_lut = [0.0f32; 256];
+    for (i, slot) in gamma_lut.iter_mut().enumerate() {
+        let lin = i as f32 / 255.0;
+        *slot = lin.powf(0.76);
+    }
+    gamma_lut
+}
+
+#[cfg(not(target_os = "windows"))]
 impl FontEngine {
     pub fn load() -> Result<Self, String> {
-        // Exact original GNOME UI font (Cantarell 98 KB) + Windows Segoe UI + clean modern Linux fallbacks
+        // Exact original GNOME UI font (Cantarell 98 KB) + clean modern Linux fallbacks
         let regular_candidates = [
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-            "C:\\Windows\\Fonts\\arial.ttf",
             "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
             "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
             "/usr/share/fonts/open-sans/OpenSans-Regular.ttf",
@@ -145,9 +189,6 @@ impl FontEngine {
             "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
         ];
         let bold_candidates = [
-            "C:\\Windows\\Fonts\\segoeuib.ttf",
-            "C:\\Windows\\Fonts\\seguisb.ttf",
-            "C:\\Windows\\Fonts\\arialbd.ttf",
             "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Bold.otf",
             "/usr/share/fonts/cantarell/Cantarell-Bold.otf",
             "/usr/share/fonts/open-sans/OpenSans-Semibold.ttf",
@@ -173,6 +214,7 @@ impl FontEngine {
 
         let settings = FontSettings {
             scale: 28.0,
+            load_substitutions: false,
             ..FontSettings::default()
         };
         let regular = Font::from_bytes(reg_bytes, settings)
@@ -180,18 +222,11 @@ impl FontEngine {
         let bold = Font::from_bytes(bold_bytes, settings)
             .map_err(|e| format!("Failed to parse bold font: {e}"))?;
 
-        // Gentle sRGB stem/gamma compensation so white text on #06060A black looks smooth & crisp like Pango/Cairo
-        let mut gamma_lut = [0.0f32; 256];
-        for (i, slot) in gamma_lut.iter_mut().enumerate() {
-            let lin = i as f32 / 255.0;
-            *slot = lin.powf(0.76);
-        }
-
         Ok(Self {
             regular,
             bold,
-            cache: HashMap::with_capacity(384),
-            gamma_lut,
+            cache: HashMap::with_capacity(256),
+            gamma_lut: build_gamma_lut(),
         })
     }
 
@@ -263,14 +298,15 @@ impl FontEngine {
     }
 
     fn glyph(&mut self, bold: bool, size: f32, phase: u8, ch: char) -> &CachedGlyph {
-        let size_key = (size * 4.0).round() as u16;
-        if self.cache.len() > 3600 {
+        let size_key = (size * 2.0).round() as u16;
+        let q_size = size_key as f32 * 0.5;
+        if self.cache.len() > 1200 {
             self.cache.clear();
         }
         let font = if bold { &self.bold } else { &self.regular };
         self.cache
             .entry((bold, size_key, phase, ch))
-            .or_insert_with(|| Self::rasterize_2x(font, size, phase, ch))
+            .or_insert_with(|| Self::rasterize_2x(font, q_size, phase, ch))
     }
 
     fn kern(&self, bold: bool, prev: Option<char>, ch: char, size: f32) -> f32 {
@@ -289,6 +325,283 @@ impl FontEngine {
             center_y + size * 0.36
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+impl FontEngine {
+    fn create_gdi_font(bold: bool, height_2x: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+        use windows::core::w;
+        use windows::Win32::Graphics::Gdi::{
+            CreateFontW, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+            FF_SWISS, FW_BOLD, FW_NORMAL, OUT_TT_PRECIS,
+        };
+        let weight = if bold {
+            FW_BOLD.0 as i32
+        } else {
+            FW_NORMAL.0 as i32
+        };
+        unsafe {
+            CreateFontW(
+                -height_2x.max(2),
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_TT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+                w!("Segoe UI"),
+            )
+        }
+    }
+
+    fn identity_mat2() -> windows::Win32::Graphics::Gdi::MAT2 {
+        use windows::Win32::Graphics::Gdi::{FIXED, MAT2};
+        MAT2 {
+            eM11: FIXED { fract: 0, value: 1 },
+            eM12: FIXED { fract: 0, value: 0 },
+            eM21: FIXED { fract: 0, value: 0 },
+            eM22: FIXED { fract: 0, value: 1 },
+        }
+    }
+
+    fn measure_cap_ratio(hdc: windows::Win32::Graphics::Gdi::HDC, bold: bool) -> f32 {
+        use windows::Win32::Graphics::Gdi::{
+            DeleteObject, GetGlyphOutlineW, SelectObject, GDI_ERROR, GGO_METRICS, GLYPHMETRICS,
+        };
+        unsafe {
+            let hf = Self::create_gdi_font(bold, 80);
+            if hf.is_invalid() {
+                return 0.72;
+            }
+            let prev = SelectObject(hdc, hf);
+            let mut gm = GLYPHMETRICS::default();
+            let mat = Self::identity_mat2();
+            let rc = GetGlyphOutlineW(hdc, 'H' as u32, GGO_METRICS, &mut gm, 0, None, &mat);
+            SelectObject(hdc, prev);
+            let _ = DeleteObject(hf);
+            if rc != GDI_ERROR as u32 && gm.gmBlackBoxY > 10 {
+                (gm.gmBlackBoxY as f32 / 80.0).clamp(0.55, 0.85)
+            } else {
+                0.72
+            }
+        }
+    }
+
+    pub fn load() -> Result<Self, String> {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, HDC, HGDIOBJ};
+        let hdc = unsafe { CreateCompatibleDC(HDC::default()) };
+        if hdc.is_invalid() {
+            return Err("CreateCompatibleDC failed for FontEngine".to_string());
+        }
+        let reg_cap_ratio = Self::measure_cap_ratio(hdc, false);
+        let bold_cap_ratio = Self::measure_cap_ratio(hdc, true);
+
+        Ok(Self {
+            hdc,
+            orig_font: HGDIOBJ::default(),
+            hfonts: HashMap::with_capacity(24),
+            scratch_buf: Vec::with_capacity(2048),
+            reg_cap_ratio,
+            bold_cap_ratio,
+            cache: HashMap::with_capacity(256),
+            gamma_lut: build_gamma_lut(),
+        })
+    }
+
+    fn select_hfont(&mut self, bold: bool, size_key: u16) {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, SelectObject};
+        if self.hfonts.len() > 48 {
+            unsafe {
+                if !self.orig_font.is_invalid() {
+                    SelectObject(self.hdc, self.orig_font);
+                }
+                for (_, hf) in self.hfonts.drain() {
+                    if !hf.is_invalid() {
+                        let _ = DeleteObject(hf);
+                    }
+                }
+            }
+        }
+        let height_2x = (size_key as i32).max(2); // size_key = round(size * 2.0) == exact 2x px height!
+        let hf = *self
+            .hfonts
+            .entry((bold, size_key))
+            .or_insert_with(|| Self::create_gdi_font(bold, height_2x));
+        if !hf.is_invalid() {
+            unsafe {
+                let prev = SelectObject(self.hdc, hf);
+                if self.orig_font.is_invalid() {
+                    self.orig_font = prev;
+                }
+            }
+        }
+    }
+
+    /// Zero-TTF-heap native Win32 GDI 2x supersampled glyph rasterizer (`GetGlyphOutlineW` + `GGO_GRAY8_BITMAP`).
+    fn rasterize_2x_gdi(&mut self, bold: bool, size_key: u16, phase: u8, ch: char) -> CachedGlyph {
+        use windows::Win32::Foundation::SIZE;
+        use windows::Win32::Graphics::Gdi::{
+            GetGlyphOutlineW, GetTextExtentPoint32W, GDI_ERROR, GGO_GRAY8_BITMAP, GLYPHMETRICS,
+        };
+
+        self.select_hfont(bold, size_key);
+        let code = if (ch as u32) <= 0xFFFF {
+            ch as u32
+        } else {
+            '?' as u32
+        };
+        let mut gm = GLYPHMETRICS::default();
+        let mat = Self::identity_mat2();
+
+        let buf_size = unsafe {
+            GetGlyphOutlineW(self.hdc, code, GGO_GRAY8_BITMAP, &mut gm, 0, None, &mat)
+        };
+        if buf_size == GDI_ERROR as u32 {
+            let u16_ch = [code as u16];
+            let mut sz = SIZE::default();
+            let adv = unsafe {
+                if GetTextExtentPoint32W(self.hdc, &u16_ch, &mut sz).as_bool() {
+                    sz.cx as f32 * 0.5
+                } else {
+                    size_key as f32 * 0.25
+                }
+            };
+            return CachedGlyph {
+                width: 0,
+                height: 0,
+                xmin: 0,
+                ymin: 0,
+                advance_width: adv,
+                bitmap: Vec::new(),
+            };
+        }
+
+        let adv = gm.gmCellIncX as f32 * 0.5;
+        if buf_size == 0 || gm.gmBlackBoxX == 0 || gm.gmBlackBoxY == 0 {
+            return CachedGlyph {
+                width: 0,
+                height: 0,
+                xmin: 0,
+                ymin: 0,
+                advance_width: adv,
+                bitmap: Vec::new(),
+            };
+        }
+
+        self.scratch_buf.resize(buf_size as usize, 0);
+        let got = unsafe {
+            GetGlyphOutlineW(
+                self.hdc,
+                code,
+                GGO_GRAY8_BITMAP,
+                &mut gm,
+                buf_size,
+                Some(self.scratch_buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mat,
+            )
+        };
+        if got == GDI_ERROR as u32 {
+            return CachedGlyph {
+                width: 0,
+                height: 0,
+                xmin: 0,
+                ymin: 0,
+                advance_width: adv,
+                bitmap: Vec::new(),
+            };
+        }
+
+        let w2 = gm.gmBlackBoxX as usize;
+        let h2 = gm.gmBlackBoxY as usize;
+        let stride = (w2 + 3) & !3;
+
+        let shift_x = if phase == 1 { 1isize } else { 0isize };
+        let x2_min = gm.gmptGlyphOrigin.x as isize + shift_x;
+        let y2_min = gm.gmptGlyphOrigin.y as isize - h2 as isize;
+        let x2_max = x2_min + w2 as isize;
+        let y2_max = y2_min + h2 as isize;
+
+        let gx0 = x2_min.div_euclid(2);
+        let gy0 = y2_min.div_euclid(2);
+        let gx1 = (x2_max + 1).div_euclid(2);
+        let gy1 = (y2_max + 1).div_euclid(2);
+
+        let w1 = (gx1 - gx0).max(0) as usize;
+        let h1 = (gy1 - gy0).max(0) as usize;
+        let mut out = vec![0u8; w1 * h1];
+
+        let buf = &self.scratch_buf;
+        let sample2 = |sx: isize, sy_from_bottom: isize| -> u32 {
+            let rx = sx - x2_min;
+            let ry_from_bottom = sy_from_bottom - y2_min;
+            if rx < 0 || rx >= w2 as isize || ry_from_bottom < 0 || ry_from_bottom >= h2 as isize {
+                return 0;
+            }
+            let row = (h2 as isize - 1 - ry_from_bottom) as usize;
+            let idx = row * stride + rx as usize;
+            buf.get(idx).copied().unwrap_or(0) as u32
+        };
+
+        for r1 in 0..h1 {
+            let gy = gy1 - 1 - r1 as isize;
+            let sy_base = gy * 2;
+            for c1 in 0..w1 {
+                let gx = gx0 + c1 as isize;
+                let sx_base = gx * 2;
+                // Each GGO_GRAY8_BITMAP pixel is 0..=64; 4-pixel sum is 0..=256 -> exact 0..=255
+                let sum = sample2(sx_base, sy_base)
+                    + sample2(sx_base + 1, sy_base)
+                    + sample2(sx_base, sy_base + 1)
+                    + sample2(sx_base + 1, sy_base + 1);
+                out[r1 * w1 + c1] = ((sum * 255 + 128) / 256).min(255) as u8;
+            }
+        }
+
+        CachedGlyph {
+            width: w1,
+            height: h1,
+            xmin: gx0 as i32,
+            ymin: gy0 as i32,
+            advance_width: adv,
+            bitmap: out,
+        }
+    }
+
+    fn glyph(&mut self, bold: bool, size: f32, phase: u8, ch: char) -> &CachedGlyph {
+        let size_key = (size * 2.0).round() as u16;
+        if self.cache.len() > 1200 {
+            self.cache.clear();
+        }
+        let key = (bold, size_key, phase, ch);
+        if !self.cache.contains_key(&key) {
+            let g = self.rasterize_2x_gdi(bold, size_key, phase, ch);
+            self.cache.insert(key, g);
+        }
+        self.cache.get(&key).unwrap()
+    }
+
+    fn kern(&self, _bold: bool, _prev: Option<char>, _ch: char, _size: f32) -> f32 {
+        0.0
+    }
+
+    /// Exact baseline Y to vertically center text around `center_y`
+    pub fn centered_baseline(&self, center_y: f32, size: f32, bold: bool) -> f32 {
+        let ratio = if bold {
+            self.bold_cap_ratio
+        } else {
+            self.reg_cap_ratio
+        };
+        center_y + size * ratio * 0.5
+    }
+}
+
+impl FontEngine {
 
     pub fn measure_width(&mut self, text: &str, size: f32, bold: bool) -> f32 {
         let mut w = 0.0f32;
@@ -375,7 +688,7 @@ impl FontEngine {
             };
 
             let _ = self.glyph(bold, size, phase, ch);
-            let size_key = (size * 4.0).round() as u16;
+            let size_key = (size * 2.0).round() as u16;
             let g = self.cache.get(&(bold, size_key, phase, ch)).unwrap();
             let gx = ix + g.xmin;
             let gy = base_y_i - g.height as i32 - g.ymin;
