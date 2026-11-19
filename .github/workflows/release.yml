@@ -156,7 +156,8 @@ jobs:
         run: |
           Get-Item target\release\arwiland.exe | Select-Object Name, Length
 
-          # --- 1. Portable Zip (Single standalone .exe, zero external DLLs!) ---
+          # --- 1. Standalone .exe & Portable Zip (Single standalone .exe, zero external DLLs!) ---
+          Copy-Item target\release\arwiland.exe Arwiland-Windows-x64.exe
           New-Item -ItemType Directory -Force -Path dist-win | Out-Null
           Copy-Item target\release\arwiland.exe dist-win\arwiland.exe
           if (Test-Path README.md) { Copy-Item README.md dist-win\README.md }
@@ -227,30 +228,52 @@ jobs:
         with:
           name: Arwiland-Windows
           path: |
-            target/release/arwiland.exe
+            Arwiland-Windows-x64.exe
             Arwiland-Windows-x64-Portable.zip
             Arwiland-Windows-x64-Setup.exe
 
   # ===========================================================================
-  # 3. AUTO-PUBLISH TO GITHUB RELEASES (on tags v* or manual dispatch)
+  # 3. AUTO-PUBLISH TO GITHUB RELEASES (on push to branch/tags or manual dispatch)
   # ===========================================================================
   release:
     name: Publish GitHub Release
     needs: [ build-linux, build-windows ]
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
+          merge-multiple: true
 
-      - name: Publish Release
+      - name: Verify Release Assets
+        run: ls -lh release-assets
+
+      - name: Publish Release to GitHub Releases Tab
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.0.1-pure-rust' }}
-          name: Arwiland Pure-Rust (Linux & Windows 10/11)
+          target_commitish: ${{ github.sha }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('Arwiland {0} — Pure Rust (Linux & Windows 10/11)', github.ref_name) || 'Arwiland v0.0.1-pure-rust — Pure Rust (Linux & Windows 10/11)' }}
+          body: |
+            ## 🏝️ Arwiland — Pure Rust (Zero GTK4)
+            Aplikasi **100% Native Pure Rust** yang ringan untuk **Linux** dan **Windows 10/11**. Pilih installer sesuai sistem operasi kamu:
+
+            - 🪟 **Windows 10 / 11 (Installer)**: Unduh **`Arwiland-Windows-x64-Setup.exe`**
+            - 🪟 **Windows 10 / 11 (Portable)**: Unduh **`Arwiland-Windows-x64-Portable.zip`** atau langsung **`Arwiland-Windows-x64.exe`**
+            - 🐧 **Linux (Ubuntu / Debian / Mint)**: Unduh **`Arwiland-Linux-amd64.deb`** (`sudo apt install ./Arwiland-Linux-amd64.deb`)
+            - 🎩 **Linux (Fedora / RHEL / openSUSE)**: Unduh **`Arwiland-Linux-x86_64.rpm`** (`sudo dnf install ./Arwiland-Linux-x86_64.rpm`)
+            - 📦 **Linux (Portable)**: Unduh **`Arwiland-Linux-x86_64-Portable.tar.gz`**
+          draft: false
+          prerelease: false
+          make_latest: "true"
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
-            release-assets/Arwiland-Linux/*
-            release-assets/Arwiland-Windows/*
+            release-assets/Arwiland-Linux-amd64.deb
+            release-assets/Arwiland-Linux-x86_64.rpm
+            release-assets/Arwiland-Linux-x86_64-Portable.tar.gz
+            release-assets/Arwiland-Windows-x64-Setup.exe
+            release-assets/Arwiland-Windows-x64-Portable.zip
+            release-assets/Arwiland-Windows-x64.exe

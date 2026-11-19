@@ -1,65 +1,99 @@
-# 🏝️ Arwiland — Cross-Platform Dynamic Island & Living Notch (Windows, macOS, Linux)
+# 🏝️ Arwiland — Ultra-Lightweight Pure-Rust Dynamic Island & Living Notch (Linux & Windows)
 
-**Arwiland** adalah aplikasi *Dynamic Island & Living Notch* ringan dan cepat yang dibangun menggunakan **Rust** dan **GTK4**. Mendukung **Windows (10/11)**, **macOS**, dan **Linux**.
+**Arwiland** adalah aplikasi *Dynamic Island & Living Notch* super ringan dan cepat yang dibangun **100% Pure Rust** (**tanpa GTK4**, **tanpa Electron**, dan **tanpa DLL eksternal**). Menggunakan renderer native (`tiny-skia` + `fontdue`) dengan backend **X11 / D-Bus** di Linux dan **Win32 / WinRT (SMTC & CoreAudio)** di Windows 10/11.
 
 ---
 
-## 📥 Download & Instalasi Langsung (Tanpa Perlu MSYS2 / Homebrew / Rust)
+## 📥 Download & Instalasi Langsung (Tanpa Perlu Rust / GTK4 / MSYS2)
 
-Kamu **tidak perlu** menginstal MSYS2, Homebrew, ataupun Rust. Cukup unduh file installer siap pakai dari halaman **[Releases](https://github.com/derisamedia/Arwiland/releases/latest)** (atau tab **[Actions](https://github.com/derisamedia/Arwiland/actions)**):
+Cukup unduh file siap pakai langsung dari tab **[Releases](https://github.com/derisamedia/Arwiland/releases/latest)**:
 
-| Sistem Operasi | File Installer Native (`v0.0.1`) | Cara Pasang |
+| Sistem Operasi | File Unduhan | Cara Pasang |
 | :--- | :--- | :--- |
-| 🪟 **Windows 10 / 11** | **[`Arwiland-Windows-Setup.exe`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | 1. Klik 2x **`Arwiland-Windows-Setup.exe`**.<br>2. Klik **Next -> Install**.<br>3. Otomatis membuat shortcut di Desktop/Start Menu, **otomatis berjalan saat Windows dinyalakan (Auto-Start)**, dan langsung menempel di bagian atas layar! |
-| 🍎 **macOS** | **[`Arwiland-macOS.dmg`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | 1. Buka file **`Arwiland-macOS.dmg`**.<br>2. Tarik (**Drag & Drop**) ikon **`Arwiland.app`** ke folder **`Applications`**.<br>3. Buka **Arwiland** dari Launchpad / Applications. |
-| 🐧 **Linux (Ubuntu / Debian / Mint)** | **[`Arwiland-Linux-amd64.deb`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | Klik 2x file `.deb` atau jalankan di terminal:<br>`sudo apt install ./Arwiland-Linux-amd64.deb` |
-| 🎩 **Linux (Fedora / RHEL / openSUSE)** | **[`Arwiland-Linux-x86_64.rpm`](https://github.com/derisamedia/Arwiland/releases/tag/v0.0.1)** | Klik 2x file `.rpm` atau jalankan di terminal:<br>`sudo dnf install ./Arwiland-Linux-x86_64.rpm` |
+| 🪟 **Windows 10 / 11 (Installer)** | **[`Arwiland-Windows-x64-Setup.exe`](https://github.com/derisamedia/Arwiland/releases/latest)** | 1. Klik 2x **`Arwiland-Windows-x64-Setup.exe`**.<br>2. Klik **Next -> Install**.<br>3. Otomatis membuat shortcut di Desktop & Start Menu dan langsung siap dijalankan. |
+| 🪟 **Windows 10 / 11 (Portable)** | **[`Arwiland-Windows-x64-Portable.zip`](https://github.com/derisamedia/Arwiland/releases/latest)** / **[`Arwiland-Windows-x64.exe`](https://github.com/derisamedia/Arwiland/releases/latest)** | Single standalone `.exe` tanpa perlu instalasi dan tanpa DLL eksternal — langsung klik 2x untuk menjalankan. |
+| 🐧 **Linux (Ubuntu / Debian / Mint)** | **[`Arwiland-Linux-amd64.deb`](https://github.com/derisamedia/Arwiland/releases/latest)** | Klik 2x file `.deb` atau jalankan di terminal:<br>`sudo apt install ./Arwiland-Linux-amd64.deb` |
+| 🎩 **Linux (Fedora / RHEL / openSUSE)** | **[`Arwiland-Linux-x86_64.rpm`](https://github.com/derisamedia/Arwiland/releases/latest)** | Klik 2x file `.rpm` atau jalankan di terminal:<br>`sudo dnf install ./Arwiland-Linux-x86_64.rpm` |
+| 📦 **Linux (Portable)** | **[`Arwiland-Linux-x86_64-Portable.tar.gz`](https://github.com/derisamedia/Arwiland/releases/latest)** | Ekstrak arsip lalu jalankan `./run.sh` (atau `./install.sh` untuk memasang ke menu aplikasi & autostart). |
+
+---
+
+## ⚡ Keunggulan Arsitektur Pure Rust
+
+- **Zero GTK4 & Zero External DLL**: Tidak lagi bergantung pada runtime GTK4/GLib di Linux maupun MSYS2/DLL tambahan di Windows.
+- **Sangat Hemat RAM & CPU**: Dioptimalkan untuk penggunaan memori rendah (`MALLOC_ARENA_MAX=2` di Linux) dan render efisien hanya saat ada perubahan UI/animasi.
+- **100% Native OS Integration**:
+  - **Linux**: X11 Layered Overlay (`x11rb` + `XShape`/`RandR`), **MPRIS** & **Desktop Notifications** via D-Bus (`zbus`).
+  - **Windows 10/11**: Win32 Transparent Overlay (`UpdateLayeredWindow`, Per-Monitor DPI Aware), **SMTC** (Media Control), **CoreAudio** (Volume/Mute), dan **WinRT Notifications**.
 
 ---
 
 ## ✨ Fitur Utama
 
-1. **🏝️ Compact & Expanded Dynamic Island + Live Notification Notch**
-   - **Mode Compact (Kapsul/Notch)**: Menampilkan *Mini Audio Spectrum Visualizer*, jam real-time, badge jumlah notifikasi belum dibaca, serta lirik lagu kata-demi-kata (*word-by-word karaoke*) atau waktu sholat berikutnya.
-   - **Live Notification Toast di Notch**: Menampilkan notifikasi aplikasi & sistem (status cas/baterai, perubahan volume/mute, waktu sholat tiba, Pomodoro selesai, target hidrasi, & drop file ke Shelf) langsung ke dalam Notch lengkap dengan ikon kategori, *ambient glow*, teks berjalan (*marquee*), dan *countdown progress bar*.
-   - **Pusat Notifikasi (`Notif` Tab)**: Riwayat lengkap notifikasi di dalam Island dengan lencana warna sesuai kategori/urgensi, tombol **Tes di Notch**, **Baca Semua**, dan **Bersihkan**.
-   - **Transisi Morphing**: Otomatis membesar (*expand*) dengan fisika pegas (*spring physics* 60/120 FPS) saat kursor diarahkan ke notch (atau diklik), dan mengecil (*collapse*) saat kursor keluar (kecuali dikunci dengan tombol **📍 Pin**).
+1. **🏝️ Compact & Expanded Dynamic Island + Living Notch (Atas / Bawah Layar)**
+   - **Posisi Fleksibel**: Dapat ditempatkan di **Atas Layar (`Top`)** maupun **Bawah Layar (`Bottom`)**, dengan gaya **Living Notch** atau **Floating Pill** serta *Y-offset* kustom.
+   - **Mode Compact (Kapsul/Notch)**: Menampilkan *Mini Audio Spectrum Visualizer*, jam real-time, badge notifikasi belum dibaca, lirik lagu kata-demi-kata (*word-by-word karaoke*), atau hitung mundur waktu sholat berikutnya.
+   - **Transisi Morphing Halus**: Otomatis membesar (*expand*) dengan fisika pegas (*spring physics*) saat kursor diarahkan ke notch (atau diklik), dan mengecil (*collapse*) saat kursor keluar (kecuali dikunci dengan tombol **📍 Pin**).
 
-2. **🎵 Media Player & Lirik Sinkron Multi-Provider**
-   - Terintegrasi dengan pemutar media sistem (Spotify, Chrome, Firefox, VLC, dll).
-   - Dilengkapi **Live Audio Spectrum Visualizer**, kontrol `Prev`, `Play/Pause`, `Next`, **Interactive Volume HUD** (bisa di-*scroll* atau digeser langsung di Notch), serta **Live Synchronized Lyrics** (mendukung LRCLIB, NetEase, KuGou KRC per-kata, Musixmatch RichSync, dan YouTube Auto-Captions).
+2. **🔔 Live Notification Toast & Pusat Notifikasi (Tab `Notif`)**
+   - Menampilkan notifikasi aplikasi & sistem (status cas/baterai, perubahan volume/mute, waktu sholat tiba, Pomodoro selesai, alarm berbunyi, target hidrasi, dll.) langsung ke dalam Notch lengkap dengan ikon kategori, *ambient glow*, teks berjalan (*marquee*), dan *countdown progress bar*.
+   - Riwayat lengkap notifikasi di tab **Notif** dengan lencana warna sesuai kategori/urgensi, tombol **Tes di Notch**, **Baca Semua**, dan **Bersihkan**.
 
-3. **⏱️ Fokus & Produktivitas (Pomodoro + Hidrasi + To-Do List)**
-   - **Pomodoro Timer Kustom**: Durasi Fokus (`1–180 menit`, default `25 menit`) & Istirahat (`1–60 menit`, default `5 menit`) yang dapat diubah langsung melalui tombol cepat (`-5m`, `-1m`, `+1m`, `+5m`) di tab **Fokus** maupun melalui **Pengaturan**, lengkap dengan penghitung sesi dan notifikasi otomatis.
-   - **Pengingat Hidrasi (Air Putih)**: Lacak target minum harian (`8 gelas / hari`).
-   - **Daily To-Do List**: Tambah, centang, dan hapus tugas harian.
+3. **🎵 Media Player, Seek Bar & Lirik Sinkron (Tab `Media`)**
+   - Terintegrasi langsung dengan pemutar media sistem via **MPRIS** (Linux) dan **SMTC** (Windows) — mendukung Spotify, Chrome, Firefox, VLC, dan lainnya.
+   - Dilengkapi **Draggable Media Duration Seek Bar** (klik atau geser langsung untuk melompat ke durasi lagu), **Live Audio Spectrum Visualizer**, kontrol `Prev`, `Play/Pause`, `Next`, serta **Interactive Volume HUD**.
+   - **Live Synchronized Lyrics** kata-demi-kata (*word-bounce* / *karaoke*) dari multi-provider (**LRCLIB**, **NetEase**, **KuGou KRC**, **Musixmatch RichSync**, dan **YouTube Auto-Captions**) lengkap dengan pengaturan *offset* sinkronisasi.
 
-4. **📂 File Shelf (Dropzone Sementara)**
-   - Tarik & lepas (*Drag & Drop*) file dari File Manager/Explorer/Finder langsung ke dalam tab **Shelf** atau gunakan tombol **Pilih**.
-   - Buka file dengan cepat atau salin path file ke clipboard kapan saja.
+4. **⏱️ Fokus, Alarm Pengingat & Hidrasi (Tab `Fokus`)**
+   - **Pomodoro Timer Kustom**: Durasi Fokus (`1–180 menit`, default `25 menit`) & Istirahat (`1–60 menit`, default `5 menit`) dengan tombol cepat (`-5m`, `-1m`, `+1m`, `+5m`), penghitung sesi selesai, dan notifikasi otomatis.
+   - **Alarm Pengingat**: Atur jam dan menit alarm langsung di tab **Fokus** lengkap dengan notifikasi di Notch dan peringatan suara.
+   - **Pengingat Hidrasi (Air Putih)**: Lacak target minum harian (`8 gelas / hari`, reset otomatis setiap hari baru).
 
-5. **🕌 Jadwal Sholat & Hitung Mundur (Kota & Kecamatan)**
-   - Perhitungan astronomis waktu sholat standar Kemenag RI (*Imsak, Subuh, Dzuhur, Ashar, Maghrib, Isya*) yang dapat diubah sesuai **Kota / Kabupaten / Kecamatan** di seluruh Indonesia (WIB, WITA, WIT) lengkap dengan fitur pencarian wilayah & hitung mundur (*countdown*).
+5. **✅ Daily To-Do List (Tab `Todo`)**
+   - Tambah, centang selesai, dan hapus daftar tugas harian langsung dari dalam Dynamic Island.
+
+6. **📂 Rak File / File Shelf (Tab `Rak`)**
+   - Simpan file sementara dengan cepat lewat tombol pilih file native OS, buka file instan, atau salin path file ke clipboard kapan saja.
+
+7. **🕌 Jadwal Sholat & Hitung Mundur (Tab `Sholat`)**
+   - Perhitungan astronomis waktu sholat standar Kemenag RI (*Imsak, Subuh, Dzuhur, Ashar, Maghrib, Isya*) sesuai **Kota / Kabupaten / Kecamatan** di seluruh Indonesia (WIB, WITA, WIT) lengkap dengan pencarian wilayah & *countdown*.
 
 ---
 
-## 🛠️ Build Manual dari Source Code (Opsional / Untuk Developer)
+## 🛠️ Build Manual dari Source Code (Untuk Developer)
 
-Jika kamu ingin memodifikasi kode sumber atau melakukan build sendiri:
+Pastikan toolchain **Rust (`cargo`)** sudah terpasang — tidak perlu menginstal library GTK4 atau dependensi GUI tambahan.
 
+### Linux
 ```bash
 git clone https://github.com/derisamedia/Arwiland.git
 cd Arwiland
 
-# Untuk Linux (otomatis compile, pasang ke menu aplikasi & autostart):
+# Build & pasang ke menu aplikasi + autostart (~/.local):
 chmod +x install.sh run.sh uninstall.sh
 ./install.sh
+
+# Atau jalankan langsung di background (gunakan --fg untuk foreground):
+./run.sh
+
+# Menghapus instalasi dari ~/.local:
+./uninstall.sh
+```
+
+### Windows 10 / 11 (Rust MSVC)
+```powershell
+git clone https://github.com/derisamedia/Arwiland.git
+cd Arwiland
+
+cargo build --release
+.\target\release\arwiland.exe
 ```
 
 ---
 
 ## 🎮 Pintasan & Tips Penggunaan
+
 - **Scroll Mouse di Notch**: Mengubah volume sistem secara instan dengan tampilan *Interactive Volume HUD*.
-- **Klik / Geser Slider Volume di Notch**: Mengatur persentase volume atau klik ikon speaker di kiri untuk *Mute/Unmute*.
-- **Tombol ⚙️ (Pengaturan)**: Mengatur gaya pulau (*Living Notch* vs *Floating Pill*), kecepatan pegas animasi, sumber lirik, offset sinkronisasi lirik, serta *Run on Startup*.
+- **Klik / Geser Slider Volume & Seek Bar**: Mengatur persentase volume, klik ikon speaker untuk *Mute/Unmute*, atau geser *seek bar* untuk melompat ke bagian lagu tertentu.
+- **Tombol ⚙️ (Pengaturan)**: Mengatur posisi pulau (**Atas / Bawah**), gaya (**Living Notch** vs **Floating Pill**), *Y-offset*, preset animasi pegas, sumber/gaya/offset lirik, durasi notifikasi, serta **Run on Startup**.
 - **Tombol 📍 (Pin)**: Mengunci Dynamic Island agar tetap terbuka meskipun kursor mouse berpindah.
