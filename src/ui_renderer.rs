@@ -7,6 +7,7 @@ use tiny_skia::{
     Point, SpreadMode, Stroke, Transform,
 };
 
+use crate::album_art::AlbumArt;
 use crate::lyrics::lyric_provider_label;
 use crate::notifications::IslandNotification;
 use crate::runtime::{ActiveTab, InputField, RuntimeContext, CANVAS_WIDTH, COMPACT_H};
@@ -2168,6 +2169,57 @@ fn draw_pill_btn(
 // PAGE 1: MEDIA + 3-LINE ROLLING KARAOKE LYRICS
 // =============================================================================
 
+fn draw_album_art(pixmap: &mut Pixmap, art: &AlbumArt, x: f32, y: f32, op: f32) {
+    let op = op.clamp(0.0, 1.0);
+    if op <= 0.01 {
+        return;
+    }
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
+    let sz = art.size as i32;
+    let ox = x.round() as i32;
+    let oy = y.round() as i32;
+    let dst = pixmap.data_mut();
+    let src = &art.premul_rgba;
+
+    for row in 0..sz {
+        let dy = oy + row;
+        if dy < 0 || dy >= ph {
+            continue;
+        }
+        let s_row = (row * sz) as usize * 4;
+        let d_row = (dy * pw) as usize * 4;
+        for col in 0..sz {
+            let dx = ox + col;
+            if dx < 0 || dx >= pw {
+                continue;
+            }
+            let si = s_row + col as usize * 4;
+            let sa_raw = src[si + 3];
+            if sa_raw == 0 {
+                continue;
+            }
+            let di = d_row + dx as usize * 4;
+            if sa_raw == 255 && op >= 0.995 {
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+                dst[di + 3] = 255;
+            } else {
+                let sr = src[si] as f32 * op;
+                let sg = src[si + 1] as f32 * op;
+                let sb = src[si + 2] as f32 * op;
+                let sa = (sa_raw as f32 / 255.0) * op;
+                let inv = 1.0 - sa;
+                dst[di] = (sr + dst[di] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 1] = (sg + dst[di + 1] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 2] = (sb + dst[di + 2] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 3] = (sa * 255.0 + dst[di + 3] as f32 * inv + 0.5).min(255.0) as u8;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_page_media(
     pixmap: &mut Pixmap,
@@ -2188,27 +2240,31 @@ fn draw_page_media(
     let (ar, ag, ab) = ctx.lyric_accent_rgb;
     let acc = ((ar * 255.0) as u8, (ag * 255.0) as u8, (ab * 255.0) as u8);
 
-    // 60x60 Emerald Gradient Album Squircle
+    // 58x58 Album Cover Squircle (real artwork when available, emerald music-note fallback otherwise)
     let art_sz = 58.0;
-    if let Some(art_path) = rounded_rect_path(px, py, art_sz, art_sz, 14.0) {
-        let stops = vec![
-            GradientStop::new(0.0, Color::from_rgba8(52, 211, 153, (255.0 * op) as u8)),
-            GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, (255.0 * op) as u8)),
-        ];
-        if let Some(grad) = LinearGradient::new(
-            Point::from_xy(px, py),
-            Point::from_xy(px + art_sz, py + art_sz),
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) {
-            let mut p = Paint::default();
-            p.shader = grad;
-            p.anti_alias = true;
-            pixmap.fill_path(&art_path, &p, FillRule::Winding, Transform::identity(), None);
+    if let Some(ref art) = ctx.album_art {
+        draw_album_art(pixmap, art, px, py, op);
+    } else {
+        if let Some(art_path) = rounded_rect_path(px, py, art_sz, art_sz, 14.0) {
+            let stops = vec![
+                GradientStop::new(0.0, Color::from_rgba8(52, 211, 153, (255.0 * op) as u8)),
+                GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, (255.0 * op) as u8)),
+            ];
+            if let Some(grad) = LinearGradient::new(
+                Point::from_xy(px, py),
+                Point::from_xy(px + art_sz, py + art_sz),
+                stops,
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                let mut p = Paint::default();
+                p.shader = grad;
+                p.anti_alias = true;
+                pixmap.fill_path(&art_path, &p, FillRule::Winding, Transform::identity(), None);
+            }
         }
+        draw_music_note_icon(pixmap, px + art_sz * 0.5, py + art_sz * 0.5, 1.85, alpha_scale((9, 9, 11, 240), op));
     }
-    draw_music_note_icon(pixmap, px + art_sz * 0.5, py + art_sz * 0.5, 1.85, alpha_scale((9, 9, 11, 240), op));
 
     // Right Media Controls + 4-bar Visualizer
     let ctrl_w = 152.0;

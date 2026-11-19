@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod album_art;
 mod lyrics;
 mod mpris;
 mod notifications;
@@ -23,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 
+use album_art::AlbumArtManager;
 use lyrics::{cycle_lyric_provider, provider_accent, LyricsManager};
 use mpris::{seek_media_to, send_mpris_command};
 use notifications::NotificationHub;
@@ -253,6 +255,7 @@ fn main() {
     let mut ctx = RuntimeContext::new(initial_state, initial_prayer, region_options);
     let bg_mon = spawn_background_monitor();
     let lyrics_mgr = LyricsManager::new();
+    let art_mgr = AlbumArtManager::new();
     let notif_hub = NotificationHub::new(ctx.app_state.notifications.clone());
 
     let pending_picked_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1189,6 +1192,8 @@ fn main() {
                 let new_m = guard.media.clone();
                 let track_changed = ctx.cached_media.title != new_m.title
                     || ctx.cached_media.artist != new_m.artist;
+                let art_changed = ctx.cached_media.art_path != new_m.art_path
+                    || (ctx.cached_media.art_image.is_none() && new_m.art_image.is_some());
                 let play_changed = ctx.cached_media.playing != new_m.playing;
 
                 let missing_timeline = new_m.playing
@@ -1223,11 +1228,36 @@ fn main() {
                         update_target_size(&mut ctx);
                     }
                 }
-                if track_changed || play_changed || (ctx.expanded && ctx.active_tab == ActiveTab::Settings) {
+                if track_changed
+                    || art_changed
+                    || play_changed
+                    || (ctx.expanded && ctx.active_tab == ActiveTab::Settings)
+                {
                     needs_redraw = true;
                 }
                 ctx.cached_media = new_m;
                 ctx.cached_metrics = guard.metrics.clone();
+                ctx.album_art = art_mgr.resolve(
+                    ctx.cached_media.has_player,
+                    &ctx.cached_media.title,
+                    &ctx.cached_media.artist,
+                    ctx.cached_media.art_path.as_deref(),
+                    ctx.cached_media.art_image.as_ref(),
+                );
+            }
+        }
+        let art_seq = art_mgr.seq();
+        if art_seq != ctx.last_art_seq {
+            ctx.last_art_seq = art_seq;
+            ctx.album_art = art_mgr.resolve(
+                ctx.cached_media.has_player,
+                &ctx.cached_media.title,
+                &ctx.cached_media.artist,
+                ctx.cached_media.art_path.as_deref(),
+                ctx.cached_media.art_image.as_ref(),
+            );
+            if ctx.expanded && ctx.active_tab == ActiveTab::Media {
+                needs_redraw = true;
             }
         }
 
