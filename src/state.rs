@@ -21,6 +21,10 @@ fn default_island_style() -> String {
     "notch".to_string()
 }
 
+fn default_island_position() -> String {
+    "top".to_string()
+}
+
 fn default_anim_preset() -> String {
     "smooth".to_string()
 }
@@ -97,6 +101,8 @@ pub struct AppState {
     pub alarm_enabled: bool,
     #[serde(default = "default_island_style")]
     pub island_style: String,
+    #[serde(default = "default_island_position")]
+    pub island_position: String,
     #[serde(default = "default_anim_preset")]
     pub anim_preset: String,
     #[serde(default = "default_compact_width")]
@@ -165,6 +171,7 @@ impl Default for AppState {
             alarm_min: 0,
             alarm_enabled: false,
             island_style: "notch".to_string(),
+            island_position: "top".to_string(),
             anim_preset: "smooth".to_string(),
             compact_width: 300,
             hover_expand: true,
@@ -212,6 +219,10 @@ impl AppState {
                 if state.island_style == "notch" && state.y_offset == 6 {
                     state.y_offset = 0;
                 }
+                if state.island_position != "top" && state.island_position != "bottom" {
+                    state.island_position = "top".to_string();
+                }
+                state.y_offset = state.y_offset.clamp(0, 64);
                 if state.max_lyric_width <= 620 {
                     state.max_lyric_width = 780;
                 }
@@ -284,10 +295,7 @@ pub fn resolve_startup_exec_command() -> String {
             .join("bin")
             .join("arwiland");
         if local_bin.exists() {
-            return format!(
-                "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
-                local_bin.to_string_lossy()
-            );
+            return format!("\"{}\"", local_bin.to_string_lossy());
         }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(project_root) = exe
@@ -300,10 +308,7 @@ pub fn resolve_startup_exec_command() -> String {
                     return format!("\"{}\"", run_script.to_string_lossy());
                 }
             }
-            return format!(
-                "env GDK_BACKEND=x11 GSK_RENDERER=cairo \"{}\"",
-                exe.to_string_lossy()
-            );
+            return format!("\"{}\"", exe.to_string_lossy());
         }
         "arwiland".to_string()
     }

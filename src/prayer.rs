@@ -818,7 +818,13 @@ pub fn search_regions_online(query: &str) -> Vec<PrayerRegion> {
         return Vec::new();
     }
 
-    let out = Command::new("curl")
+    let mut cmd = Command::new("curl");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd
         .args([
             "-4",
             "--connect-timeout",

@@ -1,8 +1,15 @@
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +25,7 @@ struct VolWorkerSignal {
     cvar: Condvar,
 }
 
-static VOL_WORKER: OnceLock<VolWorkerSignal> = OnceLock::new();
+static VOL_WORKER: OnceLock<Arc<VolWorkerSignal>> = OnceLock::new();
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -27,18 +34,18 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn ensure_volume_threads() -> &'static VolWorkerSignal {
+fn ensure_volume_threads() -> &'static Arc<VolWorkerSignal> {
     VOL_WORKER.get_or_init(|| {
-        let sig = VolWorkerSignal {
+        let sig = Arc::new(VolWorkerSignal {
             pending_vol: AtomicI32::new(-1),
             pending_mute_toggle: AtomicBool::new(false),
             lock: Mutex::new(()),
             cvar: Condvar::new(),
-        };
+        });
 
         // 1. Dedicated Coalescing Volume Setter Thread (zero UI thread blocking, zero process spam)
-        thread::spawn(|| {
-            let worker = VOL_WORKER.get().unwrap();
+        let worker = Arc::clone(&sig);
+        thread::spawn(move || {
             let mut last_applied_vol: i32 = -1;
             loop {
                 let mut v = worker.pending_vol.swap(-1, Ordering::AcqRel);
@@ -67,14 +74,9 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
             }
         });
 
-        // 2. Fast Dedicated Volume Monitor Thread
+        // 2. Event-Driven Volume Monitor Thread (zero idle process spam on Linux via `pactl subscribe`)
         thread::spawn(|| {
-            #[cfg(target_os = "linux")]
-            let poll_ms = 45;
-            #[cfg(not(target_os = "linux"))]
-            let poll_ms = 500;
-
-            loop {
+            let refresh_volume = || {
                 let since_user_ms =
                     now_epoch_ms().saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
                 if since_user_ms >= 220 {
@@ -88,7 +90,47 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(poll_ms));
+            };
+
+            // Initial volume snapshot on startup
+            refresh_volume();
+
+            #[cfg(target_os = "linux")]
+            loop {
+                let mut cmd = Command::new("pactl");
+                cmd.env("LC_ALL", "C")
+                    .arg("subscribe")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        Ok(())
+                    });
+                }
+
+                if let Ok(mut child) = cmd.spawn() {
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines().map_while(Result::ok) {
+                            if line.contains(" on sink ") || line.contains(" on server ") {
+                                refresh_volume();
+                            }
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+
+                // Fallback if pactl is unavailable or PipeWire restarted
+                thread::sleep(Duration::from_millis(1500));
+                refresh_volume();
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            loop {
+                thread::sleep(Duration::from_millis(200));
+                refresh_volume();
             }
         });
 
@@ -115,16 +157,33 @@ fn apply_platform_mute_toggle() {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_platform_mute_toggle() {
-    #[link(name = "user32")]
-    extern "system" {
-        fn keybd_event(bVk: u8, bScan: u8, dwFlags: u32, dwExtraInfo: usize);
-    }
-    const VK_VOLUME_MUTE: u8 = 0xAD;
-    const KEYEVENTF_KEYUP: u32 = 0x0002;
+fn win_audio_endpoint() -> Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume> {
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{
+        eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
     unsafe {
-        keybd_event(VK_VOLUME_MUTE, 0, 0, 0);
-        keybd_event(VK_VOLUME_MUTE, 0, KEYEVENTF_KEYUP, 0);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)
+            .ok()?;
+        device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_platform_mute_toggle() {
+    if let Some(ep) = win_audio_endpoint() {
+        unsafe {
+            if let Ok(cur) = ep.GetMute() {
+                let _ = ep.SetMute(!cur.as_bool(), std::ptr::null());
+            }
+        }
     }
 }
 
@@ -146,7 +205,15 @@ fn apply_platform_volume(vol: u32) {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_platform_volume(_vol: u32) {}
+fn apply_platform_volume(vol: u32) {
+    if let Some(ep) = win_audio_endpoint() {
+        let scalar = (vol.min(100) as f32) / 100.0;
+        unsafe {
+            let _ = ep.SetMasterVolumeLevelScalar(scalar, std::ptr::null());
+            let _ = ep.SetMute(false, std::ptr::null());
+        }
+    }
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn apply_platform_volume(_vol: u32) {}
@@ -190,7 +257,18 @@ fn query_platform_volume() -> Option<(u32, bool)> {
     Some((pct.min(100), muted))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn query_platform_volume() -> Option<(u32, bool)> {
+    let ep = win_audio_endpoint()?;
+    unsafe {
+        let scalar = ep.GetMasterVolumeLevelScalar().ok()?;
+        let muted = ep.GetMute().ok()?.as_bool();
+        let pct = (scalar * 100.0).round().clamp(0.0, 100.0) as u32;
+        Some((pct, muted))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn query_platform_volume() -> Option<(u32, bool)> {
     Some((
         LIVE_HW_VOL.load(Ordering::Acquire),

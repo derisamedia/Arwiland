@@ -1,9 +1,14 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +61,7 @@ impl IslandNotification {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resolved_icon_name(&self) -> &'static str {
         let icon_l = self.app_icon.to_lowercase();
         let app_l = self.app_name.to_lowercase();
@@ -112,6 +118,7 @@ impl IslandNotification {
         }
     }
 
+    #[allow(dead_code)]
     pub fn badge_color_class(&self) -> &'static str {
         if self.urgency >= 2 {
             return "critical";
@@ -321,16 +328,22 @@ impl NotificationHub {
     fn spawn_dbus_listener(&self) {
         let hub = self.clone();
         thread::spawn(move || loop {
-            let child_res = Command::new("dbus-monitor")
-                .args([
-                    "--session",
-                    "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
-                    "type='method_call',interface='org.gtk.Notifications',member='AddNotification'",
-                    "type='method_call',interface='org.freedesktop.portal.Notification',member='AddNotification'",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
+            let mut cmd = Command::new("dbus-monitor");
+            cmd.args([
+                "--session",
+                "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+                "type='method_call',interface='org.gtk.Notifications',member='AddNotification'",
+                "type='method_call',interface='org.freedesktop.portal.Notification',member='AddNotification'",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+            let child_res = cmd.spawn();
 
             let Ok(mut child) = child_res else {
                 thread::sleep(Duration::from_secs(2));
@@ -348,10 +361,103 @@ impl NotificationHub {
         });
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    fn spawn_dbus_listener(&self) {
+        let hub = self.clone();
+        thread::spawn(move || {
+            use std::collections::HashSet;
+            use windows::UI::Notifications::Management::{
+                UserNotificationListener, UserNotificationListenerAccessStatus,
+            };
+            use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+
+            let Ok(listener) = UserNotificationListener::Current() else {
+                return;
+            };
+            let Ok(access_op) = listener.RequestAccessAsync() else {
+                return;
+            };
+            let Ok(status) = access_op.get() else {
+                return;
+            };
+            if status != UserNotificationListenerAccessStatus::Allowed {
+                return;
+            }
+
+            let mut seen: HashSet<u32> = HashSet::new();
+            let mut first_pass = true;
+            let toast_binding = KnownNotificationBindings::ToastGeneric().ok();
+
+            loop {
+                if let Ok(op) = listener.GetNotificationsAsync(NotificationKinds::Toast) {
+                    if let Ok(list) = op.get() {
+                        let count = list.Size().unwrap_or(0);
+                        for i in 0..count {
+                            let Ok(item) = list.GetAt(i) else { continue };
+                            let Ok(uid) = item.Id() else { continue };
+                            if !seen.insert(uid) {
+                                continue;
+                            }
+                            if first_pass {
+                                continue;
+                            }
+                            let app_name = item
+                                .AppInfo()
+                                .ok()
+                                .and_then(|ai| ai.DisplayInfo().ok())
+                                .and_then(|di| di.DisplayName().ok())
+                                .map(|s| s.to_string_lossy())
+                                .unwrap_or_else(|| "Windows".to_string());
+
+                            let mut texts: Vec<String> = Vec::new();
+                            if let (Ok(notif), Some(ref tb)) = (item.Notification(), &toast_binding)
+                            {
+                                if let Ok(visual) = notif.Visual() {
+                                    if let Ok(binding) = visual.GetBinding(tb) {
+                                        if let Ok(elems) = binding.GetTextElements() {
+                                            let ec = elems.Size().unwrap_or(0);
+                                            for j in 0..ec {
+                                                if let Ok(el) = elems.GetAt(j) {
+                                                    if let Ok(t) = el.Text() {
+                                                        let s = t.to_string_lossy();
+                                                        if !s.trim().is_empty() {
+                                                            texts.push(s);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !texts.is_empty() {
+                                let summary = texts[0].clone();
+                                let body = if texts.len() > 1 {
+                                    texts[1..].join(" ")
+                                } else {
+                                    String::new()
+                                };
+                                hub.push_notification(&app_name, "", &summary, &body, 1, "windows");
+                            }
+                        }
+                        first_pass = false;
+                    }
+                }
+                thread::sleep(Duration::from_millis(1200));
+            }
+        });
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn spawn_dbus_listener(&self) {}
 }
 
+#[cfg(target_os = "linux")]
 #[derive(PartialEq)]
 enum CaptureMode {
     Idle,
@@ -359,6 +465,7 @@ enum CaptureMode {
     GtkAddNotification,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct RawNotifyBuilder {
     top_strings: Vec<String>,
@@ -376,12 +483,14 @@ struct RawNotifyBuilder {
     gtk_priority: String,
 }
 
+#[cfg(target_os = "linux")]
 impl RawNotifyBuilder {
     fn reset(&mut self) {
         *self = Self::default();
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_dbus_monitor_stream<R: BufRead>(reader: R, hub: &NotificationHub) {
     let mut mode = CaptureMode::Idle;
     let mut b = RawNotifyBuilder::default();
@@ -564,6 +673,7 @@ fn parse_dbus_monitor_stream<R: BufRead>(reader: R, hub: &NotificationHub) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn flush_builder(mode: &mut CaptureMode, b: &mut RawNotifyBuilder, hub: &NotificationHub) {
     match *mode {
         CaptureMode::Idle => {}
@@ -616,6 +726,7 @@ fn flush_builder(mode: &mut CaptureMode, b: &mut RawNotifyBuilder, hub: &Notific
     b.reset();
 }
 
+#[cfg(target_os = "linux")]
 fn extract_quoted(s: &str) -> Option<String> {
     let start = s.find('"')?;
     let rest = &s[start + 1..];
@@ -678,6 +789,7 @@ pub fn strip_html_and_trim(input: &str) -> String {
 
 /// Configures GNOME Shell's built-in notification banner popup (`org.gnome.desktop.notifications show-banners`)
 /// so that when Arwiland handles notifications inside the Dynamic Island Notch, GNOME doesn't draw a duplicate popup on top.
+#[allow(dead_code)]
 pub fn set_system_notification_banners_hidden(hide_banners: bool) {
     #[cfg(target_os = "linux")]
     {
