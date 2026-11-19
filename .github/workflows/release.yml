@@ -81,7 +81,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Depends: libc6, curl
-          Maintainer: Arwiyah <yuimizuno86@gmail.com>
+          Maintainer: Siti Arwiyah,S. Kom <yuimizuno86@gmail.com>
           Description: Arwiland - Ultra-Lightweight Dynamic Island & Living Notch
            Pure-Rust zero-GTK4 Dynamic Island & Living Notch with Media Player,
            Word-Synced Lyrics, Notifications, Focus Timer, To-Do, File Shelf, and Prayer Times.
@@ -171,6 +171,8 @@ jobs:
           InstallDir "$LOCALAPPDATA\Programs\Arwiland"
           RequestExecutionLevel user
 
+          !define MUI_ICON "assets\arwiland.ico"
+          !define MUI_UNICON "assets\arwiland.ico"
           !define MUI_ABORTWARNING
           !define MUI_FINISHPAGE_RUN "$INSTDIR\arwiland.exe"
           !define MUI_FINISHPAGE_RUN_TEXT "Jalankan Arwiland sekarang"
@@ -186,14 +188,23 @@ jobs:
           !insertmacro MUI_LANGUAGE "Indonesian"
           !insertmacro MUI_LANGUAGE "English"
 
+          VIProductVersion "0.0.1.0"
+          VIAddVersionKey /LANG=${LANG_ENGLISH} "ProductName" "Arwiland"
+          VIAddVersionKey /LANG=${LANG_ENGLISH} "CompanyName" "Siti Arwiyah,S. Kom"
+          VIAddVersionKey /LANG=${LANG_ENGLISH} "FileDescription" "Arwiland - Dynamic Island & Living Notch Installer"
+          VIAddVersionKey /LANG=${LANG_ENGLISH} "LegalCopyright" "Copyright (c) Siti Arwiyah,S. Kom"
+          VIAddVersionKey /LANG=${LANG_ENGLISH} "FileVersion" "0.0.1.0"
+
           Section "Install"
             SetOutPath "$INSTDIR"
             File "target\release\arwiland.exe"
             CreateDirectory "$SMPROGRAMS\Arwiland"
-            CreateShortCut "$SMPROGRAMS\Arwiland\Arwiland.lnk" "$INSTDIR\arwiland.exe"
-            CreateShortCut "$DESKTOP\Arwiland.lnk" "$INSTDIR\arwiland.exe"
+            CreateShortCut "$SMPROGRAMS\Arwiland\Arwiland.lnk" "$INSTDIR\arwiland.exe" "" "$INSTDIR\arwiland.exe" 0
+            CreateShortCut "$DESKTOP\Arwiland.lnk" "$INSTDIR\arwiland.exe" "" "$INSTDIR\arwiland.exe" 0
             WriteUninstaller "$INSTDIR\Uninstall.exe"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayName" "Arwiland - Dynamic Island & Living Notch"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayIcon" "$INSTDIR\arwiland.exe,0"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "Publisher" "Siti Arwiyah,S. Kom"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "UninstallString" '"$INSTDIR\Uninstall.exe"'
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arwiland" "DisplayVersion" "0.0.1"
           SectionEnd

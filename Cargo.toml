@@ -3,7 +3,7 @@ name = "arwiland"
 version = "0.0.1"
 edition = "2021"
 description = "Arwiland - Ultra-Lightweight Universal Dynamic Island & Living Notch (Pure Rust, No GTK4)"
-authors = ["Arwiyah"]
+authors = ["Siti Arwiyah,S. Kom"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -45,6 +45,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = "z"
