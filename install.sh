@@ -70,6 +70,7 @@ chmod +x "$APP_BIN_DIR/arwiland"
 cp -f assets/arwiland.svg "$APP_ICON_DIR/arwiland.svg"
 cp -f "$DIST_DIR/Arwiland.desktop" "$APP_DESKTOP_DIR/arwiland.desktop"
 cp -f "$DIST_DIR/Arwiland.desktop" "$APP_AUTOSTART_DIR/arwiland.desktop"
+printf 'X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=3\n' >> "$APP_AUTOSTART_DIR/arwiland.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$APP_DESKTOP_DIR" 2>/dev/null || true
