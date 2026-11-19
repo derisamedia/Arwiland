@@ -1,5 +1,7 @@
+use flate2::read::ZlibDecoder;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -107,6 +109,38 @@ struct NetEaseSong {
 struct NetEaseLyricResp {
     yrc: Option<NetEaseLyricField>,
     klyric: Option<NetEaseLyricField>,
+    lrc: Option<NetEaseLyricField>,
+}
+
+#[derive(Deserialize)]
+struct KuGouSearchResp {
+    data: Option<KuGouSearchData>,
+}
+
+#[derive(Deserialize)]
+struct KuGouSearchData {
+    info: Option<Vec<KuGouSongInfo>>,
+}
+
+#[derive(Deserialize)]
+struct KuGouSongInfo {
+    hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KuGouCandResp {
+    candidates: Option<Vec<KuGouCand>>,
+}
+
+#[derive(Deserialize)]
+struct KuGouCand {
+    id: Option<String>,
+    accesskey: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KuGouDownloadResp {
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -162,11 +196,12 @@ impl LyricsManager {
         offset_ms: i32,
     ) -> LyricSnapshot {
         let clean_title = clean_track_title(title);
+        let clean_artist = clean_artist_name(artist);
         let key = format!(
             "{}||{}||{}",
             provider_pref.to_lowercase(),
             clean_title.to_lowercase(),
-            artist.to_lowercase()
+            clean_artist.to_lowercase()
         );
 
         let adj_pos = (pos_sec + (offset_ms as f64 / 1000.0) + 0.12).max(0.0);
@@ -182,7 +217,7 @@ impl LyricsManager {
 
                 let cache_clone = self.cache.clone();
                 let q_title = clean_title.clone();
-                let q_artist = artist.to_string();
+                let q_artist = clean_artist;
                 let prov = provider_pref.to_string();
 
                 thread::spawn(move || {
@@ -215,18 +250,25 @@ impl LyricsManager {
                 lines,
             }) => {
                 let accent_rgb = *accent_rgb;
-                // Strict Per-Kata Gate: only display lines that support word-by-word sync!
-                let word_lines: Vec<&LyricLine> = lines
+                // Prefer word-synced lines when present, otherwise cleanly display synced LRC lines
+                let has_any_word = lines
                     .iter()
-                    .filter(|l| l.is_word_synced && !l.words.is_empty())
-                    .collect();
+                    .any(|l| l.is_word_synced && !l.words.is_empty());
+                let active_lines: Vec<&LyricLine> = if has_any_word {
+                    lines
+                        .iter()
+                        .filter(|l| l.is_word_synced && !l.words.is_empty())
+                        .collect()
+                } else {
+                    lines.iter().filter(|l| !l.text.trim().is_empty()).collect()
+                };
 
-                if word_lines.is_empty() {
+                if active_lines.is_empty() {
                     return build_empty_snapshot(provider_badge, provider_detail, accent_rgb);
                 }
 
                 // Show animated countdown dots ("●  ●  ●") before the first vocal line starts!
-                let intro_end = word_lines[0].time_sec.max(2.0);
+                let intro_end = active_lines[0].time_sec.max(2.0);
                 if adj_pos < intro_end {
                     let mut snap = build_intro_dots_snapshot(
                         adj_pos,
@@ -236,12 +278,12 @@ impl LyricsManager {
                         provider_detail,
                         accent_rgb,
                     );
-                    snap.next_line_text = word_lines[0].text.clone();
+                    snap.next_line_text = active_lines[0].text.clone();
                     return snap;
                 }
 
                 let mut cur_idx = 0;
-                for (i, line) in word_lines.iter().enumerate() {
+                for (i, line) in active_lines.iter().enumerate() {
                     if line.time_sec <= adj_pos {
                         cur_idx = i;
                     } else {
@@ -249,8 +291,8 @@ impl LyricsManager {
                     }
                 }
 
-                let cur_line = word_lines[cur_idx];
-                let next_line_start = word_lines
+                let cur_line = active_lines[cur_idx];
+                let next_line_start = active_lines
                     .get(cur_idx + 1)
                     .map(|l| l.time_sec)
                     .unwrap_or_else(|| {
@@ -262,17 +304,17 @@ impl LyricsManager {
                     });
 
                 let prev_line_text = if cur_idx > 0 {
-                    word_lines[cur_idx - 1].text.clone()
+                    active_lines[cur_idx - 1].text.clone()
                 } else {
                     String::new()
                 };
-                let next_line_text = word_lines
+                let next_line_text = active_lines
                     .get(cur_idx + 1)
                     .map(|l| l.text.clone())
                     .unwrap_or_default();
 
                 // If there is a long instrumental break before the next vocal line, show countdown dots!
-                if cur_idx + 1 < word_lines.len()
+                if cur_idx + 1 < active_lines.len()
                     && next_line_start - cur_line.end_sec >= 4.0
                     && adj_pos > cur_line.end_sec + 0.45
                     && adj_pos < next_line_start
@@ -291,7 +333,7 @@ impl LyricsManager {
                 }
 
                 // Hide lyrics cleanly after the final vocal line finishes
-                if cur_idx + 1 == word_lines.len() && adj_pos > cur_line.end_sec + 2.5 {
+                if cur_idx + 1 == active_lines.len() && adj_pos > cur_line.end_sec + 2.5 {
                     return build_empty_snapshot(provider_badge, provider_detail, accent_rgb);
                 }
 
@@ -303,8 +345,13 @@ impl LyricsManager {
                 let line_dur = (effective_end - cur_line.time_sec).clamp(0.4, 12.0);
                 let raw_line_prog = ((adj_pos - cur_line.time_sec) / line_dur).clamp(0.0, 1.0);
 
-                let (words_resolved, active_word_idx, word_prog, vocal_line_prog) =
-                    resolve_line_words(cur_line, adj_pos, raw_line_prog);
+                let line_is_word = cur_line.is_word_synced && !cur_line.words.is_empty();
+                let (words_resolved, active_word_idx, word_prog, vocal_line_prog) = if line_is_word
+                {
+                    resolve_line_words(cur_line, adj_pos, raw_line_prog)
+                } else {
+                    (Vec::new(), 0, raw_line_prog, raw_line_prog)
+                };
 
                 LyricSnapshot {
                     prev_line_text,
@@ -314,7 +361,7 @@ impl LyricsManager {
                     active_word_idx,
                     word_progress: word_prog,
                     line_progress: vocal_line_prog,
-                    is_word_synced: true,
+                    is_word_synced: line_is_word,
                     provider_badge: provider_badge.clone(),
                     provider_detail: provider_detail.clone(),
                     accent_rgb,
@@ -478,17 +525,60 @@ fn build_intro_dots_snapshot(
     }
 }
 
-fn clean_track_title(raw: &str) -> String {
-    let mut s = raw.to_string();
-    for bracket in [('(', ')'), ('[', ']')] {
-        while let (Some(a), Some(b)) = (s.find(bracket.0), s.find(bracket.1)) {
-            if b > a {
-                s.replace_range(a..=b, "");
-            } else {
-                break;
+fn strip_ascii_ci(input: &str, needle_upper: &str) -> String {
+    let mut s = input.to_string();
+    loop {
+        let low = s.to_ascii_uppercase();
+        if let Some(pos) = low.find(needle_upper) {
+            let end = pos + needle_upper.len();
+            if s.is_char_boundary(pos) && s.is_char_boundary(end) {
+                s.replace_range(pos..end, "");
+                continue;
             }
         }
+        break;
     }
+    s
+}
+
+fn clean_artist_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match trimmed.to_lowercase().as_str() {
+        "" | "google chrome" | "microsoft edge" | "firefox" | "brave" | "opera" | "spotify"
+        | "vlc media" | "media player" | "media" | "tidak ada pemutar" => return String::new(),
+        _ => {}
+    }
+    let mut s = trimmed.to_string();
+    for suffix in [" - Topic", " - topic", " VEVO", "VEVO", " Official"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim().to_string();
+        }
+    }
+    s
+}
+
+fn clean_track_title(raw: &str) -> String {
+    let mut s = raw.to_string();
+    for (open, close) in [('(', ')'), ('[', ']'), ('（', '）'), ('【', '】')] {
+        loop {
+            let Some(a) = s.find(open) else { break };
+            let after_open = a + open.len_utf8();
+            let Some(b_rel) = s[after_open..].find(close) else {
+                break;
+            };
+            let b_end = after_open + b_rel + close.len_utf8();
+            let candidate = format!("{}{}", &s[..a], &s[b_end..]);
+            if candidate.trim().is_empty() {
+                // Entire title was inside brackets (e.g. 【光年之外】): unwrap instead of deleting
+                s = s[after_open..after_open + b_rel].to_string();
+                break;
+            }
+            s = candidate;
+        }
+    }
+    // Unwrap Japanese/Chinese quotation marks cleanly (e.g. YOASOBI「アイドル」 -> YOASOBI アイドル)
+    s = s.replace(['「', '」', '『', '』'], " ");
+
     let noise_words = [
         "STADIUM BREAKBEAT",
         "SLOWBASS",
@@ -496,21 +586,20 @@ fn clean_track_title(raw: &str) -> String {
         "OFFICIAL MUSIC VIDEO",
         "OFFICIAL VIDEO",
         "OFFICIAL AUDIO",
+        "OFFICIAL MV",
         "LYRIC VIDEO",
         "LYRICS",
         "REMIX",
         "DJ ",
+        " MV",
     ];
-    let mut upper = s.to_uppercase();
     for nw in noise_words {
-        if let Some(pos) = upper.find(nw) {
-            s.replace_range(pos..pos + nw.len(), "");
-            upper = s.to_uppercase();
-        }
+        s = strip_ascii_ci(&s, nw);
     }
-    let trimmed = s.trim().trim_matches('-').trim();
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim().trim_matches('-').trim();
     if trimmed.is_empty() {
-        raw.to_string()
+        raw.trim().to_string()
     } else {
         trimmed.to_string()
     }
@@ -519,11 +608,16 @@ fn clean_track_title(raw: &str) -> String {
 fn is_metadata_credit_line(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.starts_with("作词")
+        || lower.starts_with("作詞")
         || lower.starts_with("作曲")
         || lower.starts_with("编曲")
+        || lower.starts_with("編曲")
         || lower.starts_with("制作")
+        || lower.starts_with("製作")
         || lower.starts_with("词：")
+        || lower.starts_with("詞：")
         || lower.starts_with("曲：")
+        || lower.starts_with("歌：")
         || lower.starts_with("lyricist")
         || lower.starts_with("lyrics by")
         || lower.starts_with("composed by")
@@ -654,6 +748,28 @@ fn parse_apple_ttml(ttml: &str) -> Vec<LyricLine> {
                     text: full_text,
                     words,
                     is_word_synced: true,
+                });
+            }
+        } else {
+            // Line-synced TTML fallback (common for Japanese/Chinese Apple Music tracks without word spans)
+            let mut plain = String::new();
+            let mut in_tag = false;
+            for ch in p_inner.chars() {
+                match ch {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => plain.push(ch),
+                    _ => {}
+                }
+            }
+            let full_text = unescape_xml(&plain).trim().to_string();
+            if !full_text.is_empty() && !is_metadata_credit_line(&full_text) {
+                out.push(LyricLine {
+                    time_sec: line_begin,
+                    end_sec: line_end.max(line_begin + 1.5),
+                    text: full_text,
+                    words: Vec::new(),
+                    is_word_synced: false,
                 });
             }
         }
@@ -993,6 +1109,58 @@ fn parse_enhanced_lrc(lrc_text: &str) -> Vec<LyricLine> {
     out
 }
 
+/// Parses standard line-synced LRC `[mm:ss.xx] text` (including multi-timestamp lines).
+/// Used as a reliable fallback for Japanese, Chinese, Korean & global tracks when word-level tags are unavailable.
+fn parse_standard_lrc(lrc_text: &str) -> Vec<LyricLine> {
+    let mut out: Vec<LyricLine> = Vec::new();
+    for raw_line in lrc_text.lines() {
+        let mut rem = raw_line.trim();
+        let mut times: Vec<f64> = Vec::new();
+        while rem.starts_with('[') {
+            let Some(close_b) = rem.find(']') else { break };
+            let tag = &rem[1..close_b];
+            if let Some(t) = parse_time_str(tag) {
+                times.push(t);
+                rem = &rem[close_b + 1..];
+            } else {
+                break;
+            }
+        }
+        if times.is_empty() {
+            continue;
+        }
+        let body = unescape_xml(rem.trim()).replace('＇', "'");
+        let text = body.trim().to_string();
+        if text.is_empty() || is_metadata_credit_line(&text) {
+            continue;
+        }
+        for t in times {
+            if t < 1.5 && (text.contains(" - ") || text.contains('：')) {
+                continue;
+            }
+            out.push(LyricLine {
+                time_sec: t,
+                end_sec: t + 4.0,
+                text: text.clone(),
+                words: Vec::new(),
+                is_word_synced: false,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.time_sec
+            .partial_cmp(&b.time_sec)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for i in 0..out.len() {
+        if let Some(next_t) = out.get(i + 1).map(|l| l.time_sec) {
+            out[i].end_sec = next_t.max(out[i].time_sec + 0.5).min(out[i].time_sec + 8.0);
+        }
+    }
+    out
+}
+
 /// Parses YouTube TimedText `fmt=json3` events (strictly word-level ASR `tOffsetMs`)
 fn parse_youtube_json3_words(json_bytes: &[u8]) -> Vec<LyricLine> {
     let Ok(resp) = serde_json::from_slice::<YtJson3Resp>(json_bytes) else {
@@ -1069,6 +1237,15 @@ fn parse_youtube_json3_words(json_bytes: &[u8]) -> Vec<LyricLine> {
     out
 }
 
+fn is_word_synced_state(state: &TrackLyricsState) -> bool {
+    match state {
+        TrackLyricsState::Synced { lines, .. } => {
+            lines.iter().any(|l| l.is_word_synced && !l.words.is_empty())
+        }
+        _ => false,
+    }
+}
+
 fn retag_word_state(
     state: TrackLyricsState,
     provider_id: &str,
@@ -1078,11 +1255,17 @@ fn retag_word_state(
     let accent = provider_accent(provider_id);
     match state {
         TrackLyricsState::Synced { mut lines, .. } => {
-            lines.retain(|l| l.is_word_synced && !l.words.is_empty());
+            let has_word = lines.iter().any(|l| l.is_word_synced && !l.words.is_empty());
+            if has_word {
+                lines.retain(|l| l.is_word_synced && !l.words.is_empty());
+            } else {
+                lines.retain(|l| !l.text.trim().is_empty());
+            }
             if lines.len() >= 3 {
+                let mode = if has_word { "Per-Kata" } else { "Sinkron" };
                 Some(TrackLyricsState::Synced {
                     provider_badge: badge.to_string(),
-                    provider_detail: format!("{} (Per-Kata) - {} Baris", label_prefix, lines.len()),
+                    provider_detail: format!("{} ({}) - {} Baris", label_prefix, mode, lines.len()),
                     accent_rgb: accent,
                     lines,
                 })
@@ -1101,19 +1284,23 @@ fn try_word_sync_cascade(
     badge: &str,
     label_prefix: &str,
 ) -> Option<TrackLyricsState> {
-    if let Some(st) = try_fetch_kugou_krc(clean_title, artist) {
-        return retag_word_state(st, provider_id, badge, label_prefix);
+    let mut line_fallback: Option<TrackLyricsState> = None;
+    let candidates = [
+        try_fetch_kugou_krc(clean_title, artist),
+        try_fetch_apple_ttml(clean_title, artist),
+        try_fetch_netease(clean_title, artist),
+        try_fetch_simpmusic(clean_title, artist),
+        try_fetch_lrclib_enhanced(clean_title, artist),
+    ];
+    for st in candidates.into_iter().flatten() {
+        if is_word_synced_state(&st) {
+            return retag_word_state(st, provider_id, badge, label_prefix);
+        }
+        if line_fallback.is_none() {
+            line_fallback = Some(st);
+        }
     }
-    if let Some(st) = try_fetch_apple_ttml(clean_title, artist) {
-        return retag_word_state(st, provider_id, badge, label_prefix);
-    }
-    if let Some(st) = try_fetch_netease(clean_title, artist) {
-        return retag_word_state(st, provider_id, badge, label_prefix);
-    }
-    if let Some(st) = try_fetch_lrclib_enhanced(clean_title, artist) {
-        return retag_word_state(st, provider_id, badge, label_prefix);
-    }
-    None
+    line_fallback.and_then(|st| retag_word_state(st, provider_id, badge, label_prefix))
 }
 
 fn fetch_multi_provider(provider_pref: &str, clean_title: &str, artist: &str) -> TrackLyricsState {
@@ -1208,12 +1395,11 @@ fn fetch_multi_provider(provider_pref: &str, clean_title: &str, artist: &str) ->
         }
         "yt_subtitle" => {
             if let Some(st) = try_fetch_youtube_captions(clean_title, artist) {
-                return retag_word_state(st, "yt_subtitle", "YTSUB", "Youtube Subtitle")
-                    .unwrap_or_else(|| TrackLyricsState::Unsupported {
-                        provider_badge: "YTSUB".to_string(),
-                        provider_detail: "Tidak mendukung lirik per-kata".to_string(),
-                        accent_rgb: provider_accent("yt_subtitle"),
-                    });
+                if let Some(retagged) =
+                    retag_word_state(st, "yt_subtitle", "YTSUB", "Youtube Subtitle")
+                {
+                    return retagged;
+                }
             }
             if let Some(st) = try_word_sync_cascade(
                 clean_title,
@@ -1233,21 +1419,46 @@ fn fetch_multi_provider(provider_pref: &str, clean_title: &str, artist: &str) ->
             }
         }
         _ => {
-            // Auto Mode: Strictly Word-by-Word (Per-Kata) Providers!
-            // 1. KuGou KRC (Word-Sync) -> 2. Apple TTML (Word-Sync) -> 3. NetEase YRC (Word-Sync) -> 4. LrcLib Enhanced -> 5. YouTube ASR
-            if let Some(st) = try_fetch_kugou_krc(clean_title, artist) {
+            // Auto Mode: Prefer Word-by-Word (Per-Kata) first, then gracefully fall back to Synced LRC
+            // (so Japanese, Chinese, Korean & global tracks always display synced lyrics!)
+            let mut line_fallback: Option<TrackLyricsState> = None;
+            let try_step = |res: Option<TrackLyricsState>,
+                            fb: &mut Option<TrackLyricsState>|
+             -> Option<TrackLyricsState> {
+                if let Some(st) = res {
+                    if is_word_synced_state(&st) {
+                        return Some(st);
+                    }
+                    if fb.is_none() {
+                        *fb = Some(st);
+                    }
+                }
+                None
+            };
+
+            if let Some(st) = try_step(try_fetch_kugou_krc(clean_title, artist), &mut line_fallback) {
                 return st;
             }
-            if let Some(st) = try_fetch_apple_ttml(clean_title, artist) {
+            if let Some(st) = try_step(try_fetch_apple_ttml(clean_title, artist), &mut line_fallback) {
                 return st;
             }
-            if let Some(st) = try_fetch_netease(clean_title, artist) {
+            if let Some(st) = try_step(try_fetch_netease(clean_title, artist), &mut line_fallback) {
                 return st;
             }
-            if let Some(st) = try_fetch_lrclib_enhanced(clean_title, artist) {
+            if let Some(st) = try_step(try_fetch_simpmusic(clean_title, artist), &mut line_fallback) {
                 return st;
             }
-            if let Some(st) = try_fetch_youtube_captions(clean_title, artist) {
+            if let Some(st) =
+                try_step(try_fetch_lrclib_enhanced(clean_title, artist), &mut line_fallback)
+            {
+                return st;
+            }
+            if let Some(st) =
+                try_step(try_fetch_youtube_captions(clean_title, artist), &mut line_fallback)
+            {
+                return st;
+            }
+            if let Some(st) = line_fallback {
                 return st;
             }
         }
@@ -1255,66 +1466,146 @@ fn fetch_multi_provider(provider_pref: &str, clean_title: &str, artist: &str) ->
 
     TrackLyricsState::Unsupported {
         provider_badge: "OFF".to_string(),
-        provider_detail: "Lirik per-kata tidak tersedia untuk lagu ini".to_string(),
+        provider_detail: "Lirik tersinkron tidak tersedia untuk lagu ini".to_string(),
         accent_rgb: provider_accent(provider_pref),
     }
 }
 
-/// KuGou KRC (`fmt=krc`) Word-by-Word Karaoke Fetcher & Zlib/XOR Decoder
+fn decode_base64_simple(input: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => continue,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// Pure-Rust KuGou KRC (`fmt=krc`) Word-by-Word Karaoke Fetcher & Zlib/XOR Decoder (zero Python needed!)
 fn try_fetch_kugou_krc(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let py_script = r#"
-import sys, urllib.request, urllib.parse, json, base64, zlib
-try:
-    title = sys.argv[1]
-    artist = sys.argv[2]
-    q = urllib.parse.quote((title + " " + artist).strip())
-    s_url = f"http://mobilecdn.kugou.com/api/v3/search/song?format=json&page=1&pagesize=4&keyword={q}"
-    s_data = json.loads(urllib.request.urlopen(s_url, timeout=3).read().decode("utf-8", errors="ignore"))
-    infos = (s_data.get("data") or {}).get("info") or []
-    for info in infos[:3]:
-        h = info.get("hash")
-        if not h: continue
-        c_url = f"http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&hash={h}"
-        c_data = json.loads(urllib.request.urlopen(c_url, timeout=3).read().decode("utf-8", errors="ignore"))
-        for cand in (c_data.get("candidates") or [])[:2]:
-            cid, akey = cand.get("id"), cand.get("accesskey")
-            if not cid or not akey: continue
-            d_url = f"http://lyrics.kugou.com/download?ver=1&client=pc&id={cid}&accesskey={akey}&fmt=krc&charset=utf8"
-            d_data = json.loads(urllib.request.urlopen(d_url, timeout=3).read().decode("utf-8", errors="ignore"))
-            b64 = d_data.get("content")
-            if not b64: continue
-            raw = base64.b64decode(b64)
-            if len(raw) > 4 and raw[:3] == b"krc":
-                key = [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105]
-                dec = bytes(b ^ key[i % 16] for i, b in enumerate(raw[4:]))
-                sys.stdout.write(zlib.decompress(dec).decode("utf-8", errors="replace"))
-                sys.exit(0)
-except Exception:
-    sys.exit(1)
-"#;
-
-    let out = silent_cmd("python3")
-        .args(["-c", py_script, clean_title, artist])
-        .output()
-        .or_else(|_| {
-            silent_cmd("python")
-                .args(["-c", py_script, clean_title, artist])
-                .output()
-        })
-        .ok()?;
-
-    if !out.status.success() || out.stdout.is_empty() {
+    let keyword = format!("{} {}", clean_title, artist).trim().to_string();
+    if keyword.is_empty() {
         return None;
     }
-    let krc_text = String::from_utf8_lossy(&out.stdout);
-    let parsed = parse_kugou_krc(&krc_text);
-    if parsed.len() >= 3 {
-        return Some(TrackLyricsState::Synced {
-            provider_badge: "KUGOU".to_string(),
-            provider_detail: format!("KuGou KRC (Per-Kata) - {} Baris", parsed.len()),
-            accent_rgb: provider_accent("kugou"),
-            lines: parsed,
-        });
+
+    let search_out = silent_cmd("curl")
+        .args([
+            "-4",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "3",
+            "-sG",
+            "http://mobilecdn.kugou.com/api/v3/search/song",
+            "-d",
+            "format=json&page=1&pagesize=4",
+            "--data-urlencode",
+            &format!("keyword={}", keyword),
+        ])
+        .output()
+        .ok()?;
+    if !search_out.status.success() || search_out.stdout.is_empty() {
+        return None;
+    }
+    let s_resp: KuGouSearchResp = serde_json::from_slice(&search_out.stdout).ok()?;
+    let infos = s_resp.data.and_then(|d| d.info)?;
+
+    const KRC_KEY: [u8; 16] = [
+        64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105,
+    ];
+
+    for info in infos.into_iter().take(3) {
+        let Some(hash) = info.hash.filter(|h| !h.is_empty()) else {
+            continue;
+        };
+        let cand_out = silent_cmd("curl")
+            .args([
+                "-4",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "3",
+                "-s",
+                &format!(
+                    "http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&hash={}",
+                    hash
+                ),
+            ])
+            .output()
+            .ok();
+        let Some(cand_out) = cand_out.filter(|o| o.status.success() && !o.stdout.is_empty()) else {
+            continue;
+        };
+        let Ok(c_resp) = serde_json::from_slice::<KuGouCandResp>(&cand_out.stdout) else {
+            continue;
+        };
+        let Some(cands) = c_resp.candidates else {
+            continue;
+        };
+
+        for cand in cands.into_iter().take(2) {
+            let (Some(cid), Some(akey)) = (cand.id, cand.accesskey) else {
+                continue;
+            };
+            let dl_out = silent_cmd("curl")
+                .args([
+                    "-4",
+                    "--connect-timeout",
+                    "2",
+                    "--max-time",
+                    "3",
+                    "-s",
+                    &format!(
+                        "http://lyrics.kugou.com/download?ver=1&client=pc&id={}&accesskey={}&fmt=krc&charset=utf8",
+                        cid, akey
+                    ),
+                ])
+                .output()
+                .ok();
+            let Some(dl_out) = dl_out.filter(|o| o.status.success() && !o.stdout.is_empty()) else {
+                continue;
+            };
+            let Ok(d_resp) = serde_json::from_slice::<KuGouDownloadResp>(&dl_out.stdout) else {
+                continue;
+            };
+            let Some(b64) = d_resp.content else { continue };
+            let raw = decode_base64_simple(&b64);
+            if raw.len() <= 4 || &raw[..3] != b"krc" {
+                continue;
+            }
+            let xored: Vec<u8> = raw[4..]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ KRC_KEY[i % 16])
+                .collect();
+            let mut decoder = ZlibDecoder::new(xored.as_slice());
+            let mut krc_text = String::new();
+            if decoder.read_to_string(&mut krc_text).is_ok() {
+                let parsed = parse_kugou_krc(&krc_text);
+                if parsed.len() >= 3 {
+                    return Some(TrackLyricsState::Synced {
+                        provider_badge: "KUGOU".to_string(),
+                        provider_detail: format!("KuGou KRC (Per-Kata) - {} Baris", parsed.len()),
+                        accent_rgb: provider_accent("kugou"),
+                        lines: parsed,
+                    });
+                }
+            }
+        }
     }
     None
 }
@@ -1499,9 +1790,13 @@ fn try_fetch_apple_ttml(clean_title: &str, artist: &str) -> Option<TrackLyricsSt
     None
 }
 
-/// SimpMusic (`simpmusic`) RichSync Word-Synced Lyrics
+/// SimpMusic (`simpmusic`) RichSync Word-Synced Lyrics (with Synced LRC fallback)
 fn try_fetch_simpmusic(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let query = format!("{} {}", clean_title, artist);
+    let query = format!("{} {}", clean_title, artist).trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
+    let mut line_fallback: Option<TrackLyricsState> = None;
     if let Ok(out) = silent_cmd("curl")
         .args([
             "-4",
@@ -1549,18 +1844,35 @@ fn try_fetch_simpmusic(clean_title: &str, artist: &str) -> Option<TrackLyricsSta
                                     lines: parsed,
                                 });
                             }
+                            if line_fallback.is_none() {
+                                let lrc_lines = parse_standard_lrc(synced);
+                                if lrc_lines.len() >= 3 {
+                                    line_fallback = Some(TrackLyricsState::Synced {
+                                        provider_badge: "SIMP".to_string(),
+                                        provider_detail: format!(
+                                            "SimpMusic (Sinkron) - {} Baris",
+                                            lrc_lines.len()
+                                        ),
+                                        accent_rgb: provider_accent("simpmusic"),
+                                        lines: lrc_lines,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
-    None
+    line_fallback
 }
 
-/// LrcLib (`lrclib`) Enhanced `<mm:ss.xx>` Word-Sync
+/// LrcLib (`lrclib`) Enhanced `<mm:ss.xx>` Word-Sync (with standard Synced LRC fallback for J-Pop/C-Pop/Global)
 fn try_fetch_lrclib_enhanced(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let query = format!("{} {}", clean_title, artist);
+    let query = format!("{} {}", clean_title, artist).trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
     let out = silent_cmd("curl")
         .args([
             "-4",
@@ -1576,6 +1888,7 @@ fn try_fetch_lrclib_enhanced(clean_title: &str, artist: &str) -> Option<TrackLyr
         .output()
         .ok()?;
 
+    let mut line_fallback: Option<TrackLyricsState> = None;
     if out.status.success() {
         if let Ok(items) = serde_json::from_slice::<Vec<LrcLibItem>>(&out.stdout) {
             for item in &items {
@@ -1592,16 +1905,33 @@ fn try_fetch_lrclib_enhanced(clean_title: &str, artist: &str) -> Option<TrackLyr
                             lines: parsed,
                         });
                     }
+                    if line_fallback.is_none() {
+                        let lrc_lines = parse_standard_lrc(synced);
+                        if lrc_lines.len() >= 3 {
+                            line_fallback = Some(TrackLyricsState::Synced {
+                                provider_badge: "LRCLIB".to_string(),
+                                provider_detail: format!(
+                                    "LrcLib (Sinkron) - {} Baris",
+                                    lrc_lines.len()
+                                ),
+                                accent_rgb: provider_accent("lrclib"),
+                                lines: lrc_lines,
+                            });
+                        }
+                    }
                 }
             }
         }
     }
-    None
+    line_fallback
 }
 
-/// NetEase (`netease`) 163 YRC & K-Lyric Word-by-Word
+/// NetEase (`netease`) 163 YRC & K-Lyric Word-by-Word (with standard Synced LRC fallback for Japanese/Chinese tracks)
 fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
-    let query = format!("{} {}", clean_title, artist);
+    let query = format!("{} {}", clean_title, artist).trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
     let search_out = silent_cmd("curl")
         .args([
             "-4",
@@ -1610,11 +1940,15 @@ fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState
             "--max-time",
             "3",
             "-sG",
+            "-A",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "-H",
+            "Referer: https://music.163.com/",
             "https://music.163.com/api/search/get",
             "--data-urlencode",
             &format!("s={}", query),
             "-d",
-            "type=1&limit=2",
+            "type=1&limit=3",
         ])
         .output()
         .ok()?;
@@ -1624,8 +1958,9 @@ fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState
     }
     let resp = serde_json::from_slice::<NetEaseSearchResp>(&search_out.stdout).ok()?;
     let songs = resp.result.and_then(|r| r.songs)?;
+    let mut line_fallback: Option<TrackLyricsState> = None;
 
-    for song in songs.into_iter().take(2) {
+    for song in songs.into_iter().take(3) {
         let lyr_out = silent_cmd("curl")
             .args([
                 "-4",
@@ -1634,17 +1969,20 @@ fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState
                 "--max-time",
                 "3",
                 "-s",
+                "-A",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                "-H",
+                "Referer: https://music.163.com/",
                 &format!(
                     "https://music.163.com/api/song/lyric?os=pc&id={}&lv=-1&kv=-1&tv=-1&yv=-1",
                     song.id
                 ),
             ])
             .output()
-            .ok()?;
-
-        if !lyr_out.status.success() {
+            .ok();
+        let Some(lyr_out) = lyr_out.filter(|o| o.status.success()) else {
             continue;
-        }
+        };
         if let Ok(lresp) = serde_json::from_slice::<NetEaseLyricResp>(&lyr_out.stdout) {
             if let Some(yrc_str) = lresp.yrc.and_then(|y| y.lyric) {
                 let y_parsed = parse_netease_yrc(&yrc_str);
@@ -1674,7 +2012,23 @@ fn try_fetch_netease(clean_title: &str, artist: &str) -> Option<TrackLyricsState
                     });
                 }
             }
+            if line_fallback.is_none() {
+                if let Some(lrc_str) = lresp.lrc.and_then(|l| l.lyric) {
+                    let l_parsed = parse_standard_lrc(&lrc_str);
+                    if l_parsed.len() >= 4 {
+                        line_fallback = Some(TrackLyricsState::Synced {
+                            provider_badge: "NETEASE".to_string(),
+                            provider_detail: format!(
+                                "NetEase (Sinkron) - {} Baris",
+                                l_parsed.len()
+                            ),
+                            accent_rgb: provider_accent("netease"),
+                            lines: l_parsed,
+                        });
+                    }
+                }
+            }
         }
     }
-    None
+    line_fallback
 }
