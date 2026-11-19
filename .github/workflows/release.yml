@@ -212,7 +212,12 @@ jobs:
           Set-Content -Path installer.nsi -Value $nsis -Encoding UTF8
 
           $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $makensis -and (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) {
+            $env:Path += ";C:\Program Files (x86)\NSIS"
+            $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          }
           if (-not $makensis) {
+            choco install nsis -y --no-progress
             $env:Path += ";C:\Program Files (x86)\NSIS"
           }
           makensis installer.nsi
