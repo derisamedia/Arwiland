@@ -1356,7 +1356,9 @@ fn main() {
                     if !ctx.expanded && ctx.vol_osd_remaining <= 0.0 {
                         update_target_size(&mut ctx);
                     }
+                    win.raise();
                     needs_redraw = true;
+                    urgent_redraw = true;
                 }
             }
             if ctx.active_notif_toast.is_some() && ctx.notif_toast_remaining > 0.0 {
