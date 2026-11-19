@@ -1,8 +1,14 @@
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +24,7 @@ struct VolWorkerSignal {
     cvar: Condvar,
 }
 
-static VOL_WORKER: OnceLock<VolWorkerSignal> = OnceLock::new();
+static VOL_WORKER: OnceLock<Arc<VolWorkerSignal>> = OnceLock::new();
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -27,18 +33,18 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn ensure_volume_threads() -> &'static VolWorkerSignal {
+fn ensure_volume_threads() -> &'static Arc<VolWorkerSignal> {
     VOL_WORKER.get_or_init(|| {
-        let sig = VolWorkerSignal {
+        let sig = Arc::new(VolWorkerSignal {
             pending_vol: AtomicI32::new(-1),
             pending_mute_toggle: AtomicBool::new(false),
             lock: Mutex::new(()),
             cvar: Condvar::new(),
-        };
+        });
 
         // 1. Dedicated Coalescing Volume Setter Thread (zero UI thread blocking, zero process spam)
-        thread::spawn(|| {
-            let worker = VOL_WORKER.get().unwrap();
+        let worker = Arc::clone(&sig);
+        thread::spawn(move || {
             let mut last_applied_vol: i32 = -1;
             loop {
                 let mut v = worker.pending_vol.swap(-1, Ordering::AcqRel);
@@ -67,14 +73,9 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
             }
         });
 
-        // 2. Fast Dedicated Volume Monitor Thread
+        // 2. Event-Driven Volume Monitor Thread (zero idle process spam on Linux via `pactl subscribe`)
         thread::spawn(|| {
-            #[cfg(target_os = "linux")]
-            let poll_ms = 45;
-            #[cfg(not(target_os = "linux"))]
-            let poll_ms = 500;
-
-            loop {
+            let refresh_volume = || {
                 let since_user_ms =
                     now_epoch_ms().saturating_sub(LAST_USER_VOL_SET_MS.load(Ordering::Acquire));
                 if since_user_ms >= 220 {
@@ -88,7 +89,47 @@ fn ensure_volume_threads() -> &'static VolWorkerSignal {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(poll_ms));
+            };
+
+            // Initial volume snapshot on startup
+            refresh_volume();
+
+            #[cfg(target_os = "linux")]
+            loop {
+                let mut cmd = Command::new("pactl");
+                cmd.env("LC_ALL", "C")
+                    .arg("subscribe")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        Ok(())
+                    });
+                }
+
+                if let Ok(mut child) = cmd.spawn() {
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines().map_while(Result::ok) {
+                            if line.contains(" on sink ") || line.contains(" on server ") {
+                                refresh_volume();
+                            }
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+
+                // Fallback if pactl is unavailable or PipeWire restarted
+                thread::sleep(Duration::from_millis(1500));
+                refresh_volume();
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                refresh_volume();
             }
         });
 

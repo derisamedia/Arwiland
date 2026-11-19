@@ -7,8 +7,7 @@ fi
 
 cd "$(dirname "$0")"
 export PATH="$HOME/.cargo/bin:$PATH"
-export GDK_BACKEND=x11
-export GSK_RENDERER=cairo
+export MALLOC_ARENA_MAX=2
 
 # Hentikan instance lama jika masih berjalan agar versi terbaru langsung aktif
 pkill -x arwiland 2>/dev/null || true

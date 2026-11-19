@@ -48,7 +48,7 @@ Version=1.0
 Name=Arwiland
 GenericName=Dynamic Island & Living Notch
 Comment=Dynamic Island, Living Notch, Lirik Real-Time, Jadwal Sholat & Pusat Notifikasi untuk Linux
-Exec=env GDK_BACKEND=x11 GSK_RENDERER=cairo $APP_BIN_DIR/arwiland
+Exec=env MALLOC_ARENA_MAX=2 $APP_BIN_DIR/arwiland
 Icon=arwiland
 Terminal=false
 Categories=Utility;GTK;DesktopSettings;
@@ -80,7 +80,7 @@ fi
 
 echo "==> [4/4] Menjalankan Arwiland di background..."
 if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    nohup env GDK_BACKEND=x11 GSK_RENDERER=cairo "$APP_BIN_DIR/arwiland" >/dev/null 2>&1 </dev/null &
+    nohup env MALLOC_ARENA_MAX=2 "$APP_BIN_DIR/arwiland" >/dev/null 2>&1 </dev/null &
     disown 2>/dev/null || true
     sleep 0.3
 fi

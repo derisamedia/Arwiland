@@ -32,6 +32,7 @@ pub struct LyricSnapshot {
     pub line_progress: f64,
     pub is_word_synced: bool,
     pub provider_badge: String,
+    #[allow(dead_code)]
     pub provider_detail: String,
     pub accent_rgb: (f64, f64, f64),
 }
@@ -157,19 +158,14 @@ impl LyricsManager {
             artist.to_lowercase()
         );
 
-        let state_opt = {
-            let guard = self.cache.lock().unwrap();
-            guard.get(&key).cloned()
-        };
-
         let adj_pos = (pos_sec + (offset_ms as f64 / 1000.0) + 0.12).max(0.0);
 
-        match state_opt {
+        let mut guard = self.cache.lock().unwrap();
+        match guard.get(&key) {
             None => {
-                {
-                    let mut guard = self.cache.lock().unwrap();
-                    guard.insert(key.clone(), TrackLyricsState::Loading);
-                }
+                guard.insert(key.clone(), TrackLyricsState::Loading);
+                drop(guard);
+
                 let cache_clone = self.cache.clone();
                 let q_title = clean_title.clone();
                 let q_artist = artist.to_string();
@@ -204,6 +200,7 @@ impl LyricsManager {
                 accent_rgb,
                 lines,
             }) => {
+                let accent_rgb = *accent_rgb;
                 // Strict Per-Kata Gate: only display lines that support word-by-word sync!
                 let word_lines: Vec<&LyricLine> = lines
                     .iter()
@@ -211,7 +208,7 @@ impl LyricsManager {
                     .collect();
 
                 if word_lines.is_empty() {
-                    return build_empty_snapshot(&provider_badge, &provider_detail, accent_rgb);
+                    return build_empty_snapshot(provider_badge, provider_detail, accent_rgb);
                 }
 
                 // Show animated countdown dots ("●  ●  ●") before the first vocal line starts!
@@ -221,8 +218,8 @@ impl LyricsManager {
                         adj_pos,
                         0.0,
                         intro_end,
-                        &provider_badge,
-                        &provider_detail,
+                        provider_badge,
+                        provider_detail,
                         accent_rgb,
                     );
                     snap.next_line_text = word_lines[0].text.clone();
@@ -270,8 +267,8 @@ impl LyricsManager {
                         adj_pos,
                         cur_line.end_sec + 0.45,
                         next_line_start,
-                        &provider_badge,
-                        &provider_detail,
+                        provider_badge,
+                        provider_detail,
                         accent_rgb,
                     );
                     snap.prev_line_text = cur_line.text.clone();
@@ -281,7 +278,7 @@ impl LyricsManager {
 
                 // Hide lyrics cleanly after the final vocal line finishes
                 if cur_idx + 1 == word_lines.len() && adj_pos > cur_line.end_sec + 2.5 {
-                    return build_empty_snapshot(&provider_badge, &provider_detail, accent_rgb);
+                    return build_empty_snapshot(provider_badge, provider_detail, accent_rgb);
                 }
 
                 let effective_end = if cur_line.end_sec > cur_line.time_sec + 0.3 {
@@ -304,8 +301,8 @@ impl LyricsManager {
                     word_progress: word_prog,
                     line_progress: vocal_line_prog,
                     is_word_synced: true,
-                    provider_badge,
-                    provider_detail,
+                    provider_badge: provider_badge.clone(),
+                    provider_detail: provider_detail.clone(),
                     accent_rgb,
                 }
             }
@@ -313,7 +310,7 @@ impl LyricsManager {
                 provider_badge,
                 provider_detail,
                 accent_rgb,
-            }) => build_empty_snapshot(&provider_badge, &provider_detail, accent_rgb),
+            }) => build_empty_snapshot(provider_badge, provider_detail, *accent_rgb),
         }
     }
 }
@@ -1219,30 +1216,33 @@ fn fetch_multi_provider(provider_pref: &str, clean_title: &str, artist: &str) ->
 fn try_fetch_kugou_krc(clean_title: &str, artist: &str) -> Option<TrackLyricsState> {
     let py_script = r#"
 import sys, urllib.request, urllib.parse, json, base64, zlib
-title = sys.argv[1]
-artist = sys.argv[2]
-q = urllib.parse.quote((title + " " + artist).strip())
-s_url = f"http://mobilecdn.kugou.com/api/v3/search/song?format=json&page=1&pagesize=4&keyword={q}"
-s_data = json.loads(urllib.request.urlopen(s_url, timeout=3).read().decode("utf-8", errors="ignore"))
-infos = s_data.get("data", {}).get("info") or []
-for info in infos[:3]:
-    h = info.get("hash")
-    if not h: continue
-    c_url = f"http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&hash={h}"
-    c_data = json.loads(urllib.request.urlopen(c_url, timeout=3).read().decode("utf-8", errors="ignore"))
-    for cand in (c_data.get("candidates") or [])[:2]:
-        cid, akey = cand.get("id"), cand.get("accesskey")
-        if not cid or not akey: continue
-        d_url = f"http://lyrics.kugou.com/download?ver=1&client=pc&id={cid}&accesskey={akey}&fmt=krc&charset=utf8"
-        d_data = json.loads(urllib.request.urlopen(d_url, timeout=3).read().decode("utf-8", errors="ignore"))
-        b64 = d_data.get("content")
-        if not b64: continue
-        raw = base64.b64decode(b64)
-        if len(raw) > 4 and raw[:3] == b"krc":
-            key = [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105]
-            dec = bytes(b ^ key[i % 16] for i, b in enumerate(raw[4:]))
-            sys.stdout.write(zlib.decompress(dec).decode("utf-8", errors="replace"))
-            sys.exit(0)
+try:
+    title = sys.argv[1]
+    artist = sys.argv[2]
+    q = urllib.parse.quote((title + " " + artist).strip())
+    s_url = f"http://mobilecdn.kugou.com/api/v3/search/song?format=json&page=1&pagesize=4&keyword={q}"
+    s_data = json.loads(urllib.request.urlopen(s_url, timeout=3).read().decode("utf-8", errors="ignore"))
+    infos = (s_data.get("data") or {}).get("info") or []
+    for info in infos[:3]:
+        h = info.get("hash")
+        if not h: continue
+        c_url = f"http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&hash={h}"
+        c_data = json.loads(urllib.request.urlopen(c_url, timeout=3).read().decode("utf-8", errors="ignore"))
+        for cand in (c_data.get("candidates") or [])[:2]:
+            cid, akey = cand.get("id"), cand.get("accesskey")
+            if not cid or not akey: continue
+            d_url = f"http://lyrics.kugou.com/download?ver=1&client=pc&id={cid}&accesskey={akey}&fmt=krc&charset=utf8"
+            d_data = json.loads(urllib.request.urlopen(d_url, timeout=3).read().decode("utf-8", errors="ignore"))
+            b64 = d_data.get("content")
+            if not b64: continue
+            raw = base64.b64decode(b64)
+            if len(raw) > 4 and raw[:3] == b"krc":
+                key = [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105]
+                dec = bytes(b ^ key[i % 16] for i, b in enumerate(raw[4:]))
+                sys.stdout.write(zlib.decompress(dec).decode("utf-8", errors="replace"))
+                sys.exit(0)
+except Exception:
+    sys.exit(1)
 "#;
 
     let out = Command::new("python3")

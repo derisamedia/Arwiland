@@ -2,6 +2,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -56,6 +58,7 @@ impl IslandNotification {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resolved_icon_name(&self) -> &'static str {
         let icon_l = self.app_icon.to_lowercase();
         let app_l = self.app_name.to_lowercase();
@@ -112,6 +115,7 @@ impl IslandNotification {
         }
     }
 
+    #[allow(dead_code)]
     pub fn badge_color_class(&self) -> &'static str {
         if self.urgency >= 2 {
             return "critical";
@@ -321,16 +325,22 @@ impl NotificationHub {
     fn spawn_dbus_listener(&self) {
         let hub = self.clone();
         thread::spawn(move || loop {
-            let child_res = Command::new("dbus-monitor")
-                .args([
-                    "--session",
-                    "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
-                    "type='method_call',interface='org.gtk.Notifications',member='AddNotification'",
-                    "type='method_call',interface='org.freedesktop.portal.Notification',member='AddNotification'",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
+            let mut cmd = Command::new("dbus-monitor");
+            cmd.args([
+                "--session",
+                "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+                "type='method_call',interface='org.gtk.Notifications',member='AddNotification'",
+                "type='method_call',interface='org.freedesktop.portal.Notification',member='AddNotification'",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+            let child_res = cmd.spawn();
 
             let Ok(mut child) = child_res else {
                 thread::sleep(Duration::from_secs(2));
@@ -678,6 +688,7 @@ pub fn strip_html_and_trim(input: &str) -> String {
 
 /// Configures GNOME Shell's built-in notification banner popup (`org.gnome.desktop.notifications show-banners`)
 /// so that when Arwiland handles notifications inside the Dynamic Island Notch, GNOME doesn't draw a duplicate popup on top.
+#[allow(dead_code)]
 pub fn set_system_notification_banners_hidden(hide_banners: bool) {
     #[cfg(target_os = "linux")]
     {
