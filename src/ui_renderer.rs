@@ -7,6 +7,8 @@ use tiny_skia::{
     Point, SpreadMode, Stroke, Transform,
 };
 
+use crate::album_art::AlbumArt;
+use crate::lyrics::lyric_provider_label;
 use crate::notifications::IslandNotification;
 use crate::runtime::{ActiveTab, InputField, RuntimeContext, CANVAS_WIDTH, COMPACT_H};
 
@@ -72,7 +74,7 @@ pub enum UiAction {
     SettingTogglePosition,
     SettingCycleAnimPreset,
     SettingToggleHoverExpand,
-    SettingCycleLyricProvider,
+    SettingCycleLyricProvider(i32),
     SettingCycleLyricStyle,
     SettingCompactWidth(i32),
     SettingYOffset(i32),
@@ -120,9 +122,123 @@ struct CachedGlyph {
 }
 
 #[cfg(not(target_os = "windows"))]
+struct FallbackFontData {
+    #[cfg(target_os = "linux")]
+    ptr: *const u8,
+    #[cfg(target_os = "linux")]
+    len: usize,
+    #[cfg(not(target_os = "linux"))]
+    bytes: Vec<u8>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FallbackFontData {
+    fn open(path: &str) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::File::open(path).ok()?;
+            let len = file.metadata().ok()?.len() as usize;
+            if len < 64 {
+                return None;
+            }
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED || ptr.is_null() {
+                return None;
+            }
+            Some(Self {
+                ptr: ptr as *const u8,
+                len,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let bytes = std::fs::read(path).ok()?;
+            if bytes.len() < 64 {
+                return None;
+            }
+            Some(Self { bytes })
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            std::slice::from_raw_parts(self.ptr, self.len)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &self.bytes
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), target_os = "linux"))]
+impl Drop for FallbackFontData {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+struct SkiaOutline {
+    pb: PathBuilder,
+    scale: f32,
+    off_x: f32,
+    off_y: f32,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl ttf_parser::OutlineBuilder for SkiaOutline {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.pb.move_to(x * self.scale + self.off_x, self.off_y - y * self.scale);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.pb.line_to(x * self.scale + self.off_x, self.off_y - y * self.scale);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.pb.quad_to(
+            x1 * self.scale + self.off_x,
+            self.off_y - y1 * self.scale,
+            x * self.scale + self.off_x,
+            self.off_y - y * self.scale,
+        );
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.pb.cubic_to(
+            x1 * self.scale + self.off_x,
+            self.off_y - y1 * self.scale,
+            x2 * self.scale + self.off_x,
+            self.off_y - y2 * self.scale,
+            x * self.scale + self.off_x,
+            self.off_y - y * self.scale,
+        );
+    }
+    fn close(&mut self) {
+        self.pb.close();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 pub struct FontEngine {
     regular: Font,
     bold: Font,
+    /// Lazy mmap-backed CJK/Unicode fallback font (0 bytes RAM until CJK glyph is drawn!)
+    cjk_fallback: Option<FallbackFontData>,
+    cjk_loaded: bool,
     /// Key: (bold, size_half_px, subpixel_phase_0_or_1, char)
     cache: HashMap<(bool, u16, u8, char), CachedGlyph>,
     /// Precomputed gamma-compensated coverage LUT (0..=255 -> 0.0..=1.0) for silky-smooth light-on-dark AA
@@ -130,10 +246,32 @@ pub struct FontEngine {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum WinFontFace {
+    Primary, // Segoe UI
+    Jp,      // Yu Gothic UI (Hiragana, Katakana, Kanji)
+    Zh,      // Microsoft YaHei UI (Chinese Hanzi, CJK Unified Ideographs)
+    Kr,      // Malgun Gothic (Korean Hangul)
+}
+
+#[cfg(target_os = "windows")]
+fn pick_win_font_face(ch: char) -> WinFontFace {
+    match ch as u32 {
+        // Hiragana, Katakana, Katakana Phonetic Extensions, Halfwidth Katakana
+        0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F => WinFontFace::Jp,
+        // Hangul Syllables, Jamo
+        0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => WinFontFace::Kr,
+        // CJK Radicals, Symbols & Punctuation, Bopomofo, CJK Unified Ideographs, Compatibility, Fullwidth
+        0x2E80..=0x303F | 0x3100..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF => WinFontFace::Zh,
+        _ => WinFontFace::Primary,
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub struct FontEngine {
     hdc: windows::Win32::Graphics::Gdi::HDC,
     orig_font: windows::Win32::Graphics::Gdi::HGDIOBJ,
-    hfonts: HashMap<(bool, u16), windows::Win32::Graphics::Gdi::HFONT>,
+    hfonts: HashMap<(WinFontFace, bool, u16), windows::Win32::Graphics::Gdi::HFONT>,
     scratch_buf: Vec<u8>,
     reg_cap_ratio: f32,
     bold_cap_ratio: f32,
@@ -225,8 +363,90 @@ impl FontEngine {
         Ok(Self {
             regular,
             bold,
+            cjk_fallback: None,
+            cjk_loaded: false,
             cache: HashMap::with_capacity(256),
             gamma_lut: build_gamma_lut(),
+        })
+    }
+
+    fn ensure_cjk_fallback(&mut self) {
+        if self.cjk_loaded {
+            return;
+        }
+        self.cjk_loaded = true;
+        let candidates = [
+            "/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+            "/usr/share/fonts/google-droid-sans-fonts/DroidSansJapanese.ttf",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ];
+        self.cjk_fallback = candidates.iter().find_map(|p| FallbackFontData::open(p));
+    }
+
+    fn rasterize_fallback_cjk(&self, size: f32, phase: u8, ch: char) -> Option<CachedGlyph> {
+        let fb = self.cjk_fallback.as_ref()?;
+        let face = ttf_parser::Face::parse(fb.as_slice(), 0).ok()?;
+        let gid = face.glyph_index(ch)?;
+        let upem = face.units_per_em() as f32;
+        if upem <= 1.0 {
+            return None;
+        }
+        let scale = size / upem;
+        let adv = face
+            .glyph_hor_advance(gid)
+            .map(|a| a as f32 * scale)
+            .unwrap_or(size);
+        let Some(bbox) = face.glyph_bounding_box(gid) else {
+            return Some(CachedGlyph {
+                width: 0,
+                height: 0,
+                xmin: 0,
+                ymin: 0,
+                advance_width: adv,
+                bitmap: Vec::new(),
+            });
+        };
+
+        let shift_x = if phase == 1 { 0.5f32 } else { 0.0f32 };
+        let xmin = (bbox.x_min as f32 * scale + shift_x).floor() as i32;
+        let ymin = (bbox.y_min as f32 * scale).floor() as i32;
+        let xmax = (bbox.x_max as f32 * scale + shift_x).ceil() as i32;
+        let ymax = (bbox.y_max as f32 * scale).ceil() as i32;
+        let w = (xmax - xmin).clamp(1, 128) as usize;
+        let h = (ymax - ymin).clamp(1, 128) as usize;
+
+        let mut outline = SkiaOutline {
+            pb: PathBuilder::new(),
+            scale,
+            off_x: shift_x - xmin as f32,
+            off_y: ymax as f32,
+        };
+        face.outline_glyph(gid, &mut outline)?;
+        let path = outline.pb.finish()?;
+        let mut pm = Pixmap::new(w as u32, h as u32)?;
+        let paint = paint_rgba(255, 255, 255, 255);
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+        let mut bmp = Vec::with_capacity(w * h);
+        for px in pm.data().chunks_exact(4) {
+            bmp.push(px[3]);
+        }
+        Some(CachedGlyph {
+            width: w,
+            height: h,
+            xmin,
+            ymin,
+            advance_width: adv,
+            bitmap: bmp,
         })
     }
 
@@ -303,10 +523,27 @@ impl FontEngine {
         if self.cache.len() > 1200 {
             self.cache.clear();
         }
-        let font = if bold { &self.bold } else { &self.regular };
-        self.cache
-            .entry((bold, size_key, phase, ch))
-            .or_insert_with(|| Self::rasterize_2x(font, q_size, phase, ch))
+        let key = (bold, size_key, phase, ch);
+        if !self.cache.contains_key(&key) {
+            let has_in_primary = {
+                let font = if bold { &self.bold } else { &self.regular };
+                font.lookup_glyph_index(ch) != 0
+            };
+            let g = if !has_in_primary && ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                self.ensure_cjk_fallback();
+                if let Some(fb_g) = self.rasterize_fallback_cjk(q_size, phase, ch) {
+                    fb_g
+                } else {
+                    let font = if bold { &self.bold } else { &self.regular };
+                    Self::rasterize_2x(font, q_size, phase, ch)
+                }
+            } else {
+                let font = if bold { &self.bold } else { &self.regular };
+                Self::rasterize_2x(font, q_size, phase, ch)
+            };
+            self.cache.insert(key, g);
+        }
+        self.cache.get(&key).unwrap()
     }
 
     fn kern(&self, bold: bool, prev: Option<char>, ch: char, size: f32) -> f32 {
@@ -329,7 +566,11 @@ impl FontEngine {
 
 #[cfg(target_os = "windows")]
 impl FontEngine {
-    fn create_gdi_font(bold: bool, height_2x: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+    fn create_gdi_font(
+        face: WinFontFace,
+        bold: bool,
+        height_2x: i32,
+    ) -> windows::Win32::Graphics::Gdi::HFONT {
         use windows::core::w;
         use windows::Win32::Graphics::Gdi::{
             CreateFontW, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
@@ -339,6 +580,12 @@ impl FontEngine {
             FW_BOLD.0 as i32
         } else {
             FW_NORMAL.0 as i32
+        };
+        let face_name = match face {
+            WinFontFace::Primary => w!("Segoe UI"),
+            WinFontFace::Jp => w!("Yu Gothic UI"),
+            WinFontFace::Zh => w!("Microsoft YaHei UI"),
+            WinFontFace::Kr => w!("Malgun Gothic"),
         };
         unsafe {
             CreateFontW(
@@ -355,7 +602,7 @@ impl FontEngine {
                 CLIP_DEFAULT_PRECIS.0 as u32,
                 ANTIALIASED_QUALITY.0 as u32,
                 (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-                w!("Segoe UI"),
+                face_name,
             )
         }
     }
@@ -375,7 +622,7 @@ impl FontEngine {
             DeleteObject, GetGlyphOutlineW, SelectObject, GDI_ERROR, GGO_METRICS, GLYPHMETRICS,
         };
         unsafe {
-            let hf = Self::create_gdi_font(bold, 80);
+            let hf = Self::create_gdi_font(WinFontFace::Primary, bold, 80);
             if hf.is_invalid() {
                 return 0.72;
             }
@@ -414,9 +661,9 @@ impl FontEngine {
         })
     }
 
-    fn select_hfont(&mut self, bold: bool, size_key: u16) {
+    fn select_hfont(&mut self, face: WinFontFace, bold: bool, size_key: u16) {
         use windows::Win32::Graphics::Gdi::{DeleteObject, SelectObject};
-        if self.hfonts.len() > 48 {
+        if self.hfonts.len() > 64 {
             unsafe {
                 if !self.orig_font.is_invalid() {
                     SelectObject(self.hdc, self.orig_font);
@@ -431,8 +678,8 @@ impl FontEngine {
         let height_2x = (size_key as i32).max(2); // size_key = round(size * 2.0) == exact 2x px height!
         let hf = *self
             .hfonts
-            .entry((bold, size_key))
-            .or_insert_with(|| Self::create_gdi_font(bold, height_2x));
+            .entry((face, bold, size_key))
+            .or_insert_with(|| Self::create_gdi_font(face, bold, height_2x));
         if !hf.is_invalid() {
             unsafe {
                 let prev = SelectObject(self.hdc, hf);
@@ -443,14 +690,16 @@ impl FontEngine {
         }
     }
 
-    /// Zero-TTF-heap native Win32 GDI 2x supersampled glyph rasterizer (`GetGlyphOutlineW` + `GGO_GRAY8_BITMAP`).
+    /// Zero-TTF-heap native Win32 GDI 2x supersampled glyph rasterizer (`GetGlyphOutlineW` + `GGO_GRAY8_BITMAP`),
+    /// with lazy CJK fallback (`Yu Gothic UI` / `Microsoft YaHei UI` / `Malgun Gothic`).
     fn rasterize_2x_gdi(&mut self, bold: bool, size_key: u16, phase: u8, ch: char) -> CachedGlyph {
         use windows::Win32::Foundation::SIZE;
         use windows::Win32::Graphics::Gdi::{
             GetGlyphOutlineW, GetTextExtentPoint32W, GDI_ERROR, GGO_GRAY8_BITMAP, GLYPHMETRICS,
         };
 
-        self.select_hfont(bold, size_key);
+        let primary_face = pick_win_font_face(ch);
+        self.select_hfont(primary_face, bold, size_key);
         let code = if (ch as u32) <= 0xFFFF {
             ch as u32
         } else {
@@ -459,9 +708,23 @@ impl FontEngine {
         let mut gm = GLYPHMETRICS::default();
         let mat = Self::identity_mat2();
 
-        let buf_size = unsafe {
+        let mut buf_size = unsafe {
             GetGlyphOutlineW(self.hdc, code, GGO_GRAY8_BITMAP, &mut gm, 0, None, &mat)
         };
+        // Cross-fallback between JP (Yu Gothic UI) and ZH (Microsoft YaHei UI) if one pack isn't installed
+        if (buf_size == GDI_ERROR as u32 || (buf_size == 0 && !ch.is_whitespace()))
+            && matches!(primary_face, WinFontFace::Jp | WinFontFace::Zh)
+        {
+            let alt = if primary_face == WinFontFace::Jp {
+                WinFontFace::Zh
+            } else {
+                WinFontFace::Jp
+            };
+            self.select_hfont(alt, bold, size_key);
+            buf_size = unsafe {
+                GetGlyphOutlineW(self.hdc, code, GGO_GRAY8_BITMAP, &mut gm, 0, None, &mat)
+            };
+        }
         if buf_size == GDI_ERROR as u32 {
             let u16_ch = [code as u16];
             let mut sz = SIZE::default();
@@ -2167,6 +2430,57 @@ fn draw_pill_btn(
 // PAGE 1: MEDIA + 3-LINE ROLLING KARAOKE LYRICS
 // =============================================================================
 
+fn draw_album_art(pixmap: &mut Pixmap, art: &AlbumArt, x: f32, y: f32, op: f32) {
+    let op = op.clamp(0.0, 1.0);
+    if op <= 0.01 {
+        return;
+    }
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
+    let sz = art.size as i32;
+    let ox = x.round() as i32;
+    let oy = y.round() as i32;
+    let dst = pixmap.data_mut();
+    let src = &art.premul_rgba;
+
+    for row in 0..sz {
+        let dy = oy + row;
+        if dy < 0 || dy >= ph {
+            continue;
+        }
+        let s_row = (row * sz) as usize * 4;
+        let d_row = (dy * pw) as usize * 4;
+        for col in 0..sz {
+            let dx = ox + col;
+            if dx < 0 || dx >= pw {
+                continue;
+            }
+            let si = s_row + col as usize * 4;
+            let sa_raw = src[si + 3];
+            if sa_raw == 0 {
+                continue;
+            }
+            let di = d_row + dx as usize * 4;
+            if sa_raw == 255 && op >= 0.995 {
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+                dst[di + 3] = 255;
+            } else {
+                let sr = src[si] as f32 * op;
+                let sg = src[si + 1] as f32 * op;
+                let sb = src[si + 2] as f32 * op;
+                let sa = (sa_raw as f32 / 255.0) * op;
+                let inv = 1.0 - sa;
+                dst[di] = (sr + dst[di] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 1] = (sg + dst[di + 1] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 2] = (sb + dst[di + 2] as f32 * inv + 0.5).min(255.0) as u8;
+                dst[di + 3] = (sa * 255.0 + dst[di + 3] as f32 * inv + 0.5).min(255.0) as u8;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_page_media(
     pixmap: &mut Pixmap,
@@ -2187,27 +2501,31 @@ fn draw_page_media(
     let (ar, ag, ab) = ctx.lyric_accent_rgb;
     let acc = ((ar * 255.0) as u8, (ag * 255.0) as u8, (ab * 255.0) as u8);
 
-    // 60x60 Emerald Gradient Album Squircle
+    // 58x58 Album Cover Squircle (real artwork when available, emerald music-note fallback otherwise)
     let art_sz = 58.0;
-    if let Some(art_path) = rounded_rect_path(px, py, art_sz, art_sz, 14.0) {
-        let stops = vec![
-            GradientStop::new(0.0, Color::from_rgba8(52, 211, 153, (255.0 * op) as u8)),
-            GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, (255.0 * op) as u8)),
-        ];
-        if let Some(grad) = LinearGradient::new(
-            Point::from_xy(px, py),
-            Point::from_xy(px + art_sz, py + art_sz),
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) {
-            let mut p = Paint::default();
-            p.shader = grad;
-            p.anti_alias = true;
-            pixmap.fill_path(&art_path, &p, FillRule::Winding, Transform::identity(), None);
+    if let Some(ref art) = ctx.album_art {
+        draw_album_art(pixmap, art, px, py, op);
+    } else {
+        if let Some(art_path) = rounded_rect_path(px, py, art_sz, art_sz, 14.0) {
+            let stops = vec![
+                GradientStop::new(0.0, Color::from_rgba8(52, 211, 153, (255.0 * op) as u8)),
+                GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, (255.0 * op) as u8)),
+            ];
+            if let Some(grad) = LinearGradient::new(
+                Point::from_xy(px, py),
+                Point::from_xy(px + art_sz, py + art_sz),
+                stops,
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                let mut p = Paint::default();
+                p.shader = grad;
+                p.anti_alias = true;
+                pixmap.fill_path(&art_path, &p, FillRule::Winding, Transform::identity(), None);
+            }
         }
+        draw_music_note_icon(pixmap, px + art_sz * 0.5, py + art_sz * 0.5, 1.85, alpha_scale((9, 9, 11, 240), op));
     }
-    draw_music_note_icon(pixmap, px + art_sz * 0.5, py + art_sz * 0.5, 1.85, alpha_scale((9, 9, 11, 240), op));
 
     // Right Media Controls + 4-bar Visualizer
     let ctrl_w = 152.0;
@@ -3039,17 +3357,30 @@ fn draw_page_settings(
 
     let rx = px + col_w + col_gap;
     let mut rry = py + 21.0;
-    let right_simple: [(&str, String, UiAction); 2] = [
-        ("Provider Lirik", st.lyric_provider.to_uppercase(), UiAction::SettingCycleLyricProvider),
-        ("Gaya Lirik", st.lyric_style.replace('_', " ").to_uppercase(), UiAction::SettingCycleLyricStyle),
-    ];
-    for (label, val, act) in right_simple {
-        fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-        fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, label, 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-        let bw = (fonts.measure_width(&val, 10.6, true) + 16.0).max(52.0);
-        draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + 5.0, 24.0, 8.0, 10.6, &val, false, op, act);
-        rry += row_stride;
-    }
+
+    // Provider Lirik row: `<` [PROVIDER] `>` so user can cycle all 12 providers forward or backward
+    fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Provider Lirik", 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let prov_lbl = lyric_provider_label(&st.lyric_provider);
+    let w_next = (fonts.measure_width(">", 11.0, true) + 12.0).max(28.0);
+    let w_prev = (fonts.measure_width("<", 11.0, true) + 12.0).max(28.0);
+    let prov_tr = fonts.truncate_to_width(prov_lbl, 10.2, true, 96.0);
+    let w_prov = (fonts.measure_width(&prov_tr, 10.2, true) + 14.0).max(28.0);
+    let next_x = rx + col_w - w_next - 6.0;
+    let prov_x = next_x - w_prov - 4.0;
+    let prev_x = prov_x - w_prev - 4.0;
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prev_x, rry + 5.0, 24.0, 6.0, 11.0, "<", false, op, UiAction::SettingCycleLyricProvider(-1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prov_x, rry + 5.0, 24.0, 7.0, 10.2, &prov_tr, false, op, UiAction::SettingCycleLyricProvider(1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, next_x, rry + 5.0, 24.0, 6.0, 11.0, ">", false, op, UiAction::SettingCycleLyricProvider(1));
+    rry += row_stride;
+
+    // Gaya Lirik row
+    let style_val = st.lyric_style.replace('_', " ").to_uppercase();
+    fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Gaya Lirik", 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
+    let bw = (fonts.measure_width(&style_val, 10.6, true) + 16.0).max(52.0);
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + 5.0, 24.0, 8.0, 10.6, &style_val, false, op, UiAction::SettingCycleLyricStyle);
+    rry += row_stride;
 
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
     fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Lebar ({}px)", st.compact_width), 11.8, false, alpha_scale((228, 228, 231, 240), op), None);

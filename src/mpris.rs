@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use crate::album_art::AlbumArt;
+
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -53,6 +57,7 @@ pub struct MediaStatus {
     pub title: String,
     pub artist: String,
     pub art_path: Option<String>,
+    pub art_image: Option<Arc<AlbumArt>>,
     pub playing: bool,
     pub playback_rate: f64,
     pub timeline_live: bool,
@@ -71,6 +76,7 @@ impl Default for MediaStatus {
             title: String::new(),
             artist: String::new(),
             art_path: None,
+            art_image: None,
             playing: false,
             playback_rate: 1.0,
             timeline_live: false,
@@ -305,6 +311,94 @@ pub fn find_all_mpris_buses() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn decode_file_uri_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &raw[i + 1..i + 3];
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+#[cfg(target_os = "windows")]
+struct WinThumbCache {
+    track_key: String,
+    art: Option<Arc<AlbumArt>>,
+    attempts: u8,
+}
+
+#[cfg(target_os = "windows")]
+thread_local! {
+    static WIN_THUMB_CACHE: std::cell::RefCell<WinThumbCache> = const {
+        std::cell::RefCell::new(WinThumbCache {
+            track_key: String::new(),
+            art: None,
+            attempts: 0,
+        })
+    };
+}
+
+#[cfg(target_os = "windows")]
+fn win_read_thumbnail_art(
+    props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> Option<Arc<AlbumArt>> {
+    use windows::Storage::Streams::DataReader;
+
+    let thumb_ref = props.Thumbnail().ok()?;
+    let stream = thumb_ref.OpenReadAsync().ok()?.get().ok()?;
+    let size = stream.Size().ok()?;
+    if size == 0 || size > 6 * 1024 * 1024 {
+        return None;
+    }
+    let reader = DataReader::CreateDataReader(&stream).ok()?;
+    let loaded = reader.LoadAsync(size as u32).ok()?.get().ok()?;
+    if loaded == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; loaded as usize];
+    reader.ReadBytes(&mut buf).ok()?;
+    crate::album_art::decode_to_squircle(&buf)
+}
+
+#[cfg(target_os = "windows")]
+fn win_cached_thumbnail_art(
+    track_key: &str,
+    props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> Option<Arc<AlbumArt>> {
+    WIN_THUMB_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.track_key != track_key {
+            cache.track_key.clear();
+            cache.track_key.push_str(track_key);
+            cache.art = None;
+            cache.attempts = 0;
+        }
+        if let Some(ref art) = cache.art {
+            return Some(Arc::clone(art));
+        }
+        // Retry up to 3 times on track change because Spotify/Chrome often populate Thumbnail ~500ms after Title
+        if cache.attempts < 3 {
+            cache.attempts += 1;
+            if let Some(decoded) = win_read_thumbnail_art(props) {
+                cache.art = Some(Arc::clone(&decoded));
+                return Some(decoded);
+            }
+        }
+        None
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn get_player_properties(
     conn: &Connection,
     bus: &str,
@@ -377,10 +471,14 @@ pub fn query_media_status() -> MediaStatus {
                 let title = title.unwrap_or_else(|| "Media Aktif".to_string());
                 let artist = artist.unwrap_or_else(|| player_name.clone());
                 let art_path = art_url.and_then(|u| {
-                    if let Some(stripped) = u.strip_prefix("file://") {
-                        if std::path::Path::new(stripped).exists() {
-                            return Some(stripped.to_string());
+                    let trimmed = u.trim();
+                    if let Some(stripped) = trimmed.strip_prefix("file://") {
+                        let decoded = decode_file_uri_path(stripped);
+                        if std::path::Path::new(&decoded).exists() {
+                            return Some(decoded);
                         }
+                    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                        return Some(trimmed.to_string());
                     }
                     None
                 });
@@ -399,6 +497,7 @@ pub fn query_media_status() -> MediaStatus {
                     title,
                     artist,
                     art_path,
+                    art_image: None,
                     playing,
                     playback_rate: 1.0,
                     timeline_live: true,
@@ -435,7 +534,8 @@ pub fn query_media_status() -> MediaStatus {
                         set tArtist to artist of current track
                         set tPos to player position
                         set tDur to (duration of current track) / 1000
-                        return "Spotify|" & pState & "|" & tName & "|" & tArtist & "|" & (tPos as string) & "|" & (tDur as string)
+                        set tArt to artwork url of current track
+                        return "Spotify|" & pState & "|" & tName & "|" & tArtist & "|" & (tPos as string) & "|" & (tDur as string) & "|" & tArt
                     end if
                 end tell
             end if
@@ -448,6 +548,11 @@ pub fn query_media_status() -> MediaStatus {
                 let playing = parts[1].eq_ignore_ascii_case("playing");
                 let pos_f = parts[4].replace(',', ".").parse::<f64>().unwrap_or(0.0);
                 let len_f = parts[5].replace(',', ".").parse::<f64>().unwrap_or(0.0);
+                let art_path = parts
+                    .get(6)
+                    .map(|s| s.trim())
+                    .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+                    .map(|s| s.to_string());
                 return MediaStatus {
                     active_bus: Some(parts[0].to_string()),
                     track_id: None,
@@ -455,7 +560,8 @@ pub fn query_media_status() -> MediaStatus {
                     player_name: parts[0].to_string(),
                     title: parts[2].to_string(),
                     artist: parts[3].to_string(),
-                    art_path: None,
+                    art_path,
+                    art_image: None,
                     playing,
                     playback_rate: 1.0,
                     timeline_live: true,
@@ -488,7 +594,7 @@ pub fn query_media_status() -> MediaStatus {
                 .filter(|&r| r.is_finite() && r > 0.05 && r <= 4.0)
                 .unwrap_or(1.0);
 
-            let (title, artist) = sess
+            let (title, artist, art_image) = sess
                 .TryGetMediaPropertiesAsync()
                 .ok()
                 .and_then(|op| op.get().ok())
@@ -501,20 +607,21 @@ pub fn query_media_status() -> MediaStatus {
                         .Artist()
                         .map(|s| s.to_string_lossy().trim().to_string())
                         .unwrap_or_default();
-                    (
-                        if t.is_empty() {
-                            "Media Aktif".to_string()
-                        } else {
-                            t
-                        },
-                        if a.is_empty() {
-                            player_name.clone()
-                        } else {
-                            a
-                        },
-                    )
+                    let final_t = if t.is_empty() {
+                        "Media Aktif".to_string()
+                    } else {
+                        t
+                    };
+                    let final_a = if a.is_empty() {
+                        player_name.clone()
+                    } else {
+                        a
+                    };
+                    let tkey = format!("{}||{}||{}", aumid, final_t, final_a);
+                    let thumb = win_cached_thumbnail_art(&tkey, &props);
+                    (final_t, final_a, thumb)
                 })
-                .unwrap_or_else(|| ("Media Aktif".to_string(), player_name.clone()));
+                .unwrap_or_else(|| ("Media Aktif".to_string(), player_name.clone(), None));
 
             const UNIX_EPOCH_FILETIME_TICKS: i64 = 116_444_736_000_000_000;
             let (pos_f64, len_secs, timeline_live) = sess
@@ -561,6 +668,7 @@ pub fn query_media_status() -> MediaStatus {
                 title,
                 artist,
                 art_path: None,
+                art_image,
                 playing,
                 playback_rate,
                 timeline_live,
@@ -579,6 +687,7 @@ pub fn query_media_status() -> MediaStatus {
         title: "Tidak ada media diputar".to_string(),
         artist: "Putar musik di Spotify, Chrome, atau VLC".to_string(),
         art_path: None,
+        art_image: None,
         playing: false,
         playback_rate: 1.0,
         timeline_live: false,

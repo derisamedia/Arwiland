@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::album_art::AlbumArt;
 use crate::lyrics::{provider_accent, LyricWord};
 use crate::mpris::{query_media_status, MediaStatus};
 use crate::notifications::IslandNotification;
@@ -154,6 +155,8 @@ pub struct RuntimeContext {
 
     // Media & Lyrics
     pub cached_media: MediaStatus,
+    pub album_art: Option<Arc<AlbumArt>>,
+    pub last_art_seq: u64,
     pub cached_metrics: SystemMetrics,
     pub last_seen_seq: u64,
     pub interp_pos_sec: f64,
@@ -265,6 +268,8 @@ impl RuntimeContext {
             alarm_ring_remaining_secs: 0,
             last_triggered_alarm_key: String::new(),
             cached_media: MediaStatus::default(),
+            album_art: None,
+            last_art_seq: 0,
             cached_metrics: SystemMetrics::default(),
             last_seen_seq: 0,
             interp_pos_sec: 0.0,

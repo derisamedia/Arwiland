@@ -363,104 +363,527 @@ impl NotificationHub {
 
     #[cfg(target_os = "windows")]
     fn spawn_dbus_listener(&self) {
-        // UserNotificationListener requires Windows Package Identity (MSIX/Sparse Package).
-        // Calling it from an unpackaged Win32 .exe loads ~10-15 MB of WinRT notification DLLs
-        // only to return empty lists, so check package identity via kernel32 first.
-        if !win_has_package_identity() {
-            return;
-        }
         let hub = self.clone();
-        thread::spawn(move || {
-            use std::collections::HashSet;
-            use windows::UI::Notifications::Management::{
-                UserNotificationListener, UserNotificationListenerAccessStatus,
-            };
-            use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        if win_has_package_identity() {
+            thread::spawn(move || win_run_uwp_notification_listener(hub));
+        } else {
+            // Unpackaged Win32 .exe on Windows 10/11: watch WPN SQLite WAL/DB directly
+            // (works without MSIX package identity and avoids ~10-15 MB of WinRT notification DLLs!)
+            thread::spawn(move || win_run_wpndatabase_listener(hub));
+        }
+    }
 
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn spawn_dbus_listener(&self) {}
+}
 
-            let Ok(listener) = UserNotificationListener::Current() else {
-                return;
-            };
-            let Ok(access_op) = listener.RequestAccessAsync() else {
-                return;
-            };
-            let Ok(status) = access_op.get() else {
-                return;
-            };
-            if status != UserNotificationListenerAccessStatus::Allowed {
-                return;
-            }
+#[cfg(target_os = "windows")]
+fn win_run_uwp_notification_listener(hub: NotificationHub) {
+    use std::collections::HashSet;
+    use windows::UI::Notifications::Management::{
+        UserNotificationListener, UserNotificationListenerAccessStatus,
+    };
+    use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-            let mut seen: HashSet<u32> = HashSet::new();
-            let mut first_pass = true;
-            let toast_binding = KnownNotificationBindings::ToastGeneric().ok();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
 
-            loop {
-                if let Ok(op) = listener.GetNotificationsAsync(NotificationKinds::Toast) {
-                    if let Ok(list) = op.get() {
-                        let count = list.Size().unwrap_or(0);
-                        for i in 0..count {
-                            let Ok(item) = list.GetAt(i) else { continue };
-                            let Ok(uid) = item.Id() else { continue };
-                            if !seen.insert(uid) {
-                                continue;
-                            }
-                            if first_pass {
-                                continue;
-                            }
-                            let app_name = item
-                                .AppInfo()
-                                .ok()
-                                .and_then(|ai| ai.DisplayInfo().ok())
-                                .and_then(|di| di.DisplayName().ok())
-                                .map(|s| s.to_string_lossy())
-                                .unwrap_or_else(|| "Windows".to_string());
+    let Ok(listener) = UserNotificationListener::Current() else {
+        win_run_wpndatabase_listener(hub);
+        return;
+    };
+    let Ok(access_op) = listener.RequestAccessAsync() else {
+        win_run_wpndatabase_listener(hub);
+        return;
+    };
+    let Ok(status) = access_op.get() else {
+        win_run_wpndatabase_listener(hub);
+        return;
+    };
+    if status != UserNotificationListenerAccessStatus::Allowed {
+        win_run_wpndatabase_listener(hub);
+        return;
+    }
 
-                            let mut texts: Vec<String> = Vec::new();
-                            if let (Ok(notif), Some(ref tb)) = (item.Notification(), &toast_binding)
-                            {
-                                if let Ok(visual) = notif.Visual() {
-                                    if let Ok(binding) = visual.GetBinding(tb) {
-                                        if let Ok(elems) = binding.GetTextElements() {
-                                            let ec = elems.Size().unwrap_or(0);
-                                            for j in 0..ec {
-                                                if let Ok(el) = elems.GetAt(j) {
-                                                    if let Ok(t) = el.Text() {
-                                                        let s = t.to_string_lossy();
-                                                        if !s.trim().is_empty() {
-                                                            texts.push(s);
-                                                        }
-                                                    }
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut first_pass = true;
+    let toast_binding = KnownNotificationBindings::ToastGeneric().ok();
+
+    loop {
+        if let Ok(op) = listener.GetNotificationsAsync(NotificationKinds::Toast) {
+            if let Ok(list) = op.get() {
+                let count = list.Size().unwrap_or(0);
+                for i in 0..count {
+                    let Ok(item) = list.GetAt(i) else { continue };
+                    let Ok(uid) = item.Id() else { continue };
+                    if !seen.insert(uid) {
+                        continue;
+                    }
+                    if first_pass {
+                        continue;
+                    }
+                    let app_name = item
+                        .AppInfo()
+                        .ok()
+                        .and_then(|ai| ai.DisplayInfo().ok())
+                        .and_then(|di| di.DisplayName().ok())
+                        .map(|s| s.to_string_lossy())
+                        .unwrap_or_else(|| "Windows".to_string());
+
+                    let mut texts: Vec<String> = Vec::new();
+                    if let (Ok(notif), Some(ref tb)) = (item.Notification(), &toast_binding) {
+                        if let Ok(visual) = notif.Visual() {
+                            if let Ok(binding) = visual.GetBinding(tb) {
+                                if let Ok(elems) = binding.GetTextElements() {
+                                    let ec = elems.Size().unwrap_or(0);
+                                    for j in 0..ec {
+                                        if let Ok(el) = elems.GetAt(j) {
+                                            if let Ok(t) = el.Text() {
+                                                let s = t.to_string_lossy();
+                                                if !s.trim().is_empty() {
+                                                    texts.push(s);
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            if !texts.is_empty() {
-                                let summary = texts[0].clone();
-                                let body = if texts.len() > 1 {
-                                    texts[1..].join(" ")
-                                } else {
-                                    String::new()
-                                };
-                                hub.push_notification(&app_name, "", &summary, &body, 1, "windows");
-                            }
                         }
-                        first_pass = false;
+                    }
+                    if !texts.is_empty() {
+                        let summary = texts[0].clone();
+                        let body = if texts.len() > 1 {
+                            texts[1..].join(" ")
+                        } else {
+                            String::new()
+                        };
+                        hub.push_notification(&app_name, "", &summary, &body, 1, "windows");
                     }
                 }
-                thread::sleep(Duration::from_millis(1200));
+                first_pass = false;
             }
-        });
+        }
+        thread::sleep(Duration::from_millis(1200));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win_now_filetime_ticks() -> i64 {
+    const UNIX_EPOCH_FILETIME_TICKS: i64 = 116_444_736_000_000_000;
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    UNIX_EPOCH_FILETIME_TICKS
+        + (d.as_secs() as i64) * 10_000_000
+        + (d.subsec_nanos() as i64) / 100
+}
+
+#[cfg(target_os = "windows")]
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(target_os = "windows")]
+fn win_read_shared_file(path: &std::path::Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_ALL)
+        .open(path)
+        .ok()?;
+    let meta_len = f.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
+    if meta_len == 0 || meta_len > max_bytes {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta_len);
+    f.take(max_bytes as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+#[cfg(target_os = "windows")]
+fn win_file_sig(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    Some((meta.len(), mtime))
+}
+
+#[cfg(target_os = "windows")]
+fn win_find_recent_arrival_time(buf: &[u8], toast_pos: usize, now_ft: i64) -> Option<i64> {
+    let win_start = toast_pos.saturating_sub(96);
+    if toast_pos < win_start + 8 {
+        return None;
+    }
+    let min_ft = now_ft - 120 * 10_000_000;
+    let max_ft = now_ft + 10 * 10_000_000;
+    let slice = &buf[win_start..toast_pos];
+    // Scan right-to-left (ArrivalTime sits directly before DataVersion + Payload in wpndatabase.db)
+    for i in (0..=slice.len() - 8).rev() {
+        let val = i64::from_be_bytes([
+            slice[i],
+            slice[i + 1],
+            slice[i + 2],
+            slice[i + 3],
+            slice[i + 4],
+            slice[i + 5],
+            slice[i + 6],
+            slice[i + 7],
+        ]);
+        if val >= min_ft && val <= max_ft {
+            return Some(val);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn win_infer_toast_app(xml: &str, attribution: Option<&str>) -> String {
+    let lower_all = xml.to_lowercase();
+    let check_hint = |s: &str| -> Option<&'static str> {
+        if s.contains("whatsapp") {
+            Some("WhatsApp")
+        } else if s.contains("telegram") {
+            Some("Telegram")
+        } else if s.contains("discord") {
+            Some("Discord")
+        } else if s.contains("chrome") {
+            Some("Google Chrome")
+        } else if s.contains("msedge") || s.contains("microsoft.edge") {
+            Some("Microsoft Edge")
+        } else if s.contains("firefox") {
+            Some("Firefox")
+        } else if s.contains("spotify") {
+            Some("Spotify")
+        } else if s.contains("teams") {
+            Some("Microsoft Teams")
+        } else if s.contains("outlook") || s.contains("hxmail") {
+            Some("Outlook")
+        } else if s.contains("slack") {
+            Some("Slack")
+        } else if s.contains("sechealth") || s.contains("defender") {
+            Some("Keamanan Windows")
+        } else if s.contains("windowsupdate") {
+            Some("Windows Update")
+        } else if s.contains("steam") {
+            Some("Steam")
+        } else if s.contains("instagram") {
+            Some("Instagram")
+        } else {
+            None
+        }
+    };
+
+    if let Some(attr) = attribution {
+        let attr_l = attr.to_lowercase();
+        if let Some(known) = check_hint(&attr_l) {
+            return known.to_string();
+        }
+        let cleaned = attr
+            .trim()
+            .trim_start_matches("Via ")
+            .trim_start_matches("via ")
+            .trim();
+        if !cleaned.is_empty() && cleaned.len() <= 32 {
+            return cleaned.to_string();
+        }
+    }
+    if let Some(known) = check_hint(&lower_all) {
+        return known.to_string();
+    }
+    "Windows".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn win_parse_toast_xml(xml: &str) -> Option<(String, String, String)> {
+    let mut texts: Vec<String> = Vec::new();
+    let mut attribution: Option<String> = None;
+    let mut rem = xml;
+
+    while let Some(pos) = rem.find("<text") {
+        let after = &rem[pos + 5..];
+        // Must be `<text>` or `<text ...>` (not `<textbox>`)
+        let next_b = after.as_bytes().first().copied().unwrap_or(0);
+        if next_b != b'>' && next_b != b' ' && next_b != b'\t' && next_b != b'\r' && next_b != b'\n'
+        {
+            rem = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let header = &after[..gt];
+        let body_start = &after[gt + 1..];
+        if header.ends_with('/') {
+            rem = body_start;
+            continue;
+        }
+        let Some(close_pos) = body_start.find("</text>") else {
+            break;
+        };
+        let raw_content = &body_start[..close_pos];
+        rem = &body_start[close_pos + 7..];
+
+        let cleaned = strip_html_and_trim(raw_content);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let is_attr = header.contains("placement=\"attribution\"")
+            || header.contains("placement='attribution'");
+        if is_attr {
+            attribution = Some(cleaned);
+        } else {
+            texts.push(cleaned);
+        }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    fn spawn_dbus_listener(&self) {}
+    if texts.is_empty() {
+        return None;
+    }
+    let app_name = win_infer_toast_app(xml, attribution.as_deref());
+    let summary = texts[0].clone();
+    let body = if texts.len() > 1 {
+        texts[1..].join(" ")
+    } else {
+        String::new()
+    };
+    Some((app_name, summary, body))
+}
+
+#[cfg(target_os = "windows")]
+fn win_scan_buffer_for_toasts(
+    buf: &[u8],
+    startup_ft: i64,
+    now_ft: i64,
+    seed_only: bool,
+    seen: &mut std::collections::HashSet<u64>,
+    hub: &NotificationHub,
+) {
+    let needle = b"<toast";
+    let end_needle = b"</toast>";
+    let mut idx = 0usize;
+
+    while idx + needle.len() < buf.len() {
+        let Some(rel) = buf[idx..].windows(needle.len()).position(|w| w == needle) else {
+            break;
+        };
+        let start = idx + rel;
+        let after_start = start + needle.len();
+        let next_b = buf.get(after_start).copied().unwrap_or(0);
+        if next_b != b'>' && next_b != b' ' && next_b != b'\t' && next_b != b'\r' && next_b != b'\n'
+        {
+            idx = after_start;
+            continue;
+        }
+        let search_limit = (start + 16384).min(buf.len());
+        let Some(end_rel) = buf[after_start..search_limit]
+            .windows(end_needle.len())
+            .position(|w| w == end_needle)
+        else {
+            idx = after_start;
+            continue;
+        };
+        let end = after_start + end_rel + end_needle.len();
+        let xml_bytes = &buf[start..end];
+        idx = end;
+
+        let arrival_opt = win_find_recent_arrival_time(buf, start, now_ft);
+        let xml_hash = fnv1a_64(xml_bytes);
+        let key = if let Some(arr) = arrival_opt {
+            xml_hash ^ (arr as u64).rotate_left(17)
+        } else {
+            xml_hash
+        };
+
+        if seed_only {
+            seen.insert(xml_hash);
+            seen.insert(key);
+            continue;
+        }
+
+        // If ArrivalTime is clearly from before startup, ignore (rewritten page during Action Center dismissal)
+        if let Some(arr) = arrival_opt {
+            if arr < startup_ft - 3 * 10_000_000 {
+                seen.insert(key);
+                continue;
+            }
+        } else if seen.contains(&xml_hash) {
+            continue;
+        }
+
+        if !seen.insert(key) {
+            continue;
+        }
+        if arrival_opt.is_none() {
+            seen.insert(xml_hash);
+        }
+
+        let xml_str = String::from_utf8_lossy(xml_bytes);
+        if let Some((app, summary, body)) = win_parse_toast_xml(&xml_str) {
+            hub.push_notification(&app, "", &summary, &body, 1, "windows");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win_scan_wal_frames(
+    wal: &[u8],
+    start_frame: usize,
+    startup_ft: i64,
+    now_ft: i64,
+    seed_only: bool,
+    seen: &mut std::collections::HashSet<u64>,
+    hub: &NotificationHub,
+) -> (usize, [u8; 8]) {
+    if wal.len() < 32 {
+        return (0, [0u8; 8]);
+    }
+    let magic = u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]);
+    if magic != 0x377F_0682 && magic != 0x377F_0683 {
+        // Not a standard WAL header; scan raw slice safely
+        win_scan_buffer_for_toasts(wal, startup_ft, now_ft, seed_only, seen, hub);
+        return (0, [0u8; 8]);
+    }
+    let page_size = u32::from_be_bytes([wal[8], wal[9], wal[10], wal[11]]) as usize;
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return (0, [0u8; 8]);
+    }
+    let mut salt = [0u8; 8];
+    salt.copy_from_slice(&wal[16..24]);
+
+    let frame_stride = 24 + page_size;
+    let total_frames = (wal.len() - 32) / frame_stride;
+    let mut valid_frames = 0usize;
+
+    for fi in 0..total_frames {
+        let f_off = 32 + fi * frame_stride;
+        if wal[f_off + 8..f_off + 16] != salt {
+            break;
+        }
+        valid_frames = fi + 1;
+        if fi < start_frame {
+            continue;
+        }
+        let payload = &wal[f_off + 24..f_off + frame_stride];
+        win_scan_buffer_for_toasts(payload, startup_ft, now_ft, seed_only, seen, hub);
+    }
+
+    (valid_frames, salt)
+}
+
+#[cfg(target_os = "windows")]
+fn win_read_shm_header(path: &std::path::Path) -> Option<[u8; 48]> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_ALL)
+        .open(path)
+        .ok()?;
+    let mut hdr = [0u8; 48];
+    f.read_exact(&mut hdr).ok()?;
+    Some(hdr)
+}
+
+#[cfg(target_os = "windows")]
+fn win_run_wpndatabase_listener(hub: NotificationHub) {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    let Ok(local_app_data) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let notif_dir = PathBuf::from(local_app_data)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Notifications");
+    let db_path = notif_dir.join("wpndatabase.db");
+    let wal_path = notif_dir.join("wpndatabase.db-wal");
+    let shm_path = notif_dir.join("wpndatabase.db-shm");
+
+    let startup_ft = win_now_filetime_ticks();
+    let mut seen: HashSet<u64> = HashSet::with_capacity(256);
+    let mut last_shm_hdr = win_read_shm_header(&shm_path);
+    let mut last_wal_sig = win_file_sig(&wal_path);
+    let mut last_db_sig = win_file_sig(&db_path);
+    let mut last_wal_salt = [0u8; 8];
+    let mut last_wal_frames = 0usize;
+
+    // Seed existing notifications so old Action Center history isn't replayed on startup
+    if let Some(db_bytes) = win_read_shared_file(&db_path, 32 * 1024 * 1024) {
+        win_scan_buffer_for_toasts(&db_bytes, startup_ft, startup_ft, true, &mut seen, &hub);
+    }
+    if let Some(wal_bytes) = win_read_shared_file(&wal_path, 16 * 1024 * 1024) {
+        let (frames, salt) =
+            win_scan_wal_frames(&wal_bytes, 0, startup_ft, startup_ft, true, &mut seen, &hub);
+        last_wal_frames = frames;
+        last_wal_salt = salt;
+    }
+
+    loop {
+        thread::sleep(Duration::from_millis(450));
+
+        // Reading 48 bytes from wpndatabase.db-shm catches EVERY SQLite WAL commit on Windows 10
+        // immediately (even when NTFS delays updating LastWriteTime/length on an open handle!)
+        let cur_shm_hdr = win_read_shm_header(&shm_path);
+        let cur_wal_sig = win_file_sig(&wal_path);
+        let cur_db_sig = win_file_sig(&db_path);
+        let shm_changed = cur_shm_hdr != last_shm_hdr;
+        let wal_changed = shm_changed || cur_wal_sig != last_wal_sig;
+        let db_changed = cur_db_sig != last_db_sig;
+
+        if !wal_changed && !db_changed {
+            continue;
+        }
+
+        last_shm_hdr = cur_shm_hdr;
+        let now_ft = win_now_filetime_ticks();
+        let mut scanned_wal = false;
+
+        if wal_changed {
+            last_wal_sig = cur_wal_sig;
+            if let Some(wal_bytes) = win_read_shared_file(&wal_path, 16 * 1024 * 1024) {
+                let same_salt = wal_bytes.len() >= 24 && wal_bytes[16..24] == last_wal_salt;
+                let start_frame = if same_salt { last_wal_frames } else { 0 };
+                let (frames, salt) = win_scan_wal_frames(
+                    &wal_bytes,
+                    start_frame,
+                    startup_ft,
+                    now_ft,
+                    false,
+                    &mut seen,
+                    &hub,
+                );
+                if frames > 0 {
+                    scanned_wal = true;
+                }
+                last_wal_frames = frames;
+                last_wal_salt = salt;
+            } else {
+                last_wal_frames = 0;
+                last_wal_salt = [0u8; 8];
+            }
+        }
+
+        if db_changed {
+            last_db_sig = cur_db_sig;
+            if !scanned_wal {
+                if let Some(db_bytes) = win_read_shared_file(&db_path, 32 * 1024 * 1024) {
+                    win_scan_buffer_for_toasts(&db_bytes, startup_ft, now_ft, false, &mut seen, &hub);
+                }
+            }
+        }
+
+        if seen.len() > 2048 {
+            seen.clear();
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
