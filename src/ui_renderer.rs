@@ -7,6 +7,7 @@ use tiny_skia::{
     Point, SpreadMode, Stroke, Transform,
 };
 
+use crate::lyrics::lyric_provider_label;
 use crate::notifications::IslandNotification;
 use crate::runtime::{ActiveTab, InputField, RuntimeContext, CANVAS_WIDTH, COMPACT_H};
 
@@ -72,7 +73,7 @@ pub enum UiAction {
     SettingTogglePosition,
     SettingCycleAnimPreset,
     SettingToggleHoverExpand,
-    SettingCycleLyricProvider,
+    SettingCycleLyricProvider(i32),
     SettingCycleLyricStyle,
     SettingCompactWidth(i32),
     SettingYOffset(i32),
@@ -3039,17 +3040,30 @@ fn draw_page_settings(
 
     let rx = px + col_w + col_gap;
     let mut rry = py + 21.0;
-    let right_simple: [(&str, String, UiAction); 2] = [
-        ("Provider Lirik", st.lyric_provider.to_uppercase(), UiAction::SettingCycleLyricProvider),
-        ("Gaya Lirik", st.lyric_style.replace('_', " ").to_uppercase(), UiAction::SettingCycleLyricStyle),
-    ];
-    for (label, val, act) in right_simple {
-        fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-        fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, label, 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-        let bw = (fonts.measure_width(&val, 10.6, true) + 16.0).max(52.0);
-        draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + 5.0, 24.0, 8.0, 10.6, &val, false, op, act);
-        rry += row_stride;
-    }
+
+    // Provider Lirik row: `<` [PROVIDER] `>` so user can cycle all 12 providers forward or backward
+    fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Provider Lirik", 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let prov_lbl = lyric_provider_label(&st.lyric_provider);
+    let w_next = (fonts.measure_width(">", 11.0, true) + 12.0).max(28.0);
+    let w_prev = (fonts.measure_width("<", 11.0, true) + 12.0).max(28.0);
+    let prov_tr = fonts.truncate_to_width(prov_lbl, 10.2, true, 96.0);
+    let w_prov = (fonts.measure_width(&prov_tr, 10.2, true) + 14.0).max(28.0);
+    let next_x = rx + col_w - w_next - 6.0;
+    let prov_x = next_x - w_prov - 4.0;
+    let prev_x = prov_x - w_prev - 4.0;
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prev_x, rry + 5.0, 24.0, 6.0, 11.0, "<", false, op, UiAction::SettingCycleLyricProvider(-1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prov_x, rry + 5.0, 24.0, 7.0, 10.2, &prov_tr, false, op, UiAction::SettingCycleLyricProvider(1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, next_x, rry + 5.0, 24.0, 6.0, 11.0, ">", false, op, UiAction::SettingCycleLyricProvider(1));
+    rry += row_stride;
+
+    // Gaya Lirik row
+    let style_val = st.lyric_style.replace('_', " ").to_uppercase();
+    fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Gaya Lirik", 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
+    let bw = (fonts.measure_width(&style_val, 10.6, true) + 16.0).max(52.0);
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + 5.0, 24.0, 8.0, 10.6, &style_val, false, op, UiAction::SettingCycleLyricStyle);
+    rry += row_stride;
 
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
     fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Lebar ({}px)", st.compact_width), 11.8, false, alpha_scale((228, 228, 231, 240), op), None);

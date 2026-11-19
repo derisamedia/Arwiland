@@ -329,6 +329,40 @@ impl LyricsManager {
     }
 }
 
+/// All supported word-synced lyric providers (single source of truth for Settings UI & fetcher).
+pub const LYRIC_PROVIDERS: &[(&str, &str)] = &[
+    ("auto", "AUTO"),
+    ("apple", "APPLE MUSIC"),
+    ("youlyplus", "YOULY PLUS"),
+    ("simpmusic", "SIMPMUSIC"),
+    ("kugou", "KUGOU"),
+    ("netease", "NETEASE"),
+    ("qqmusic", "QQMUSIC"),
+    ("deezer", "DEEZER"),
+    ("lrclib", "LRCLIB"),
+    ("yt_captions", "YT CAPTIONS"),
+    ("yt_subtitle", "YT SUBTITLE"),
+    ("yt_music", "YT MUSIC"),
+];
+
+pub fn lyric_provider_label(id: &str) -> &'static str {
+    LYRIC_PROVIDERS
+        .iter()
+        .find(|(pid, _)| pid.eq_ignore_ascii_case(id))
+        .map(|(_, lbl)| *lbl)
+        .unwrap_or("AUTO")
+}
+
+pub fn cycle_lyric_provider(current: &str, delta: i32) -> &'static str {
+    let len = LYRIC_PROVIDERS.len() as i32;
+    let cur_idx = LYRIC_PROVIDERS
+        .iter()
+        .position(|(pid, _)| pid.eq_ignore_ascii_case(current))
+        .unwrap_or(0) as i32;
+    let next_idx = (cur_idx + delta).rem_euclid(len) as usize;
+    LYRIC_PROVIDERS[next_idx].0
+}
+
 /// Color Consistency Lock (`taste-SKILL.md` §4.2): Singular Emerald accent `(0.20, 0.83, 0.60)` (`#34d399`)
 pub fn provider_accent(_provider: &str) -> (f64, f64, f64) {
     (0.20, 0.83, 0.60)
@@ -1262,6 +1296,11 @@ except Exception:
     let out = silent_cmd("python3")
         .args(["-c", py_script, clean_title, artist])
         .output()
+        .or_else(|_| {
+            silent_cmd("python")
+                .args(["-c", py_script, clean_title, artist])
+                .output()
+        })
         .ok()?;
 
     if !out.status.success() || out.stdout.is_empty() {

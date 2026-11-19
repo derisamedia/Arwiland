@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 
-use lyrics::{provider_accent, LyricsManager};
+use lyrics::{cycle_lyric_provider, provider_accent, LyricsManager};
 use mpris::{seek_media_to, send_mpris_command};
 use notifications::NotificationHub;
 use prayer::{
@@ -782,15 +782,20 @@ fn main() {
                                         ctx.app_state.hover_expand = !ctx.app_state.hover_expand;
                                         ctx.app_state.save();
                                     }
-                                    UiAction::SettingCycleLyricProvider => {
-                                        ctx.app_state.lyric_provider = match ctx.app_state.lyric_provider.as_str() {
-                                            "auto" => "lrclib".to_string(),
-                                            "lrclib" => "youtube".to_string(),
-                                            "youtube" => "netease".to_string(),
-                                            _ => "auto".to_string(),
-                                        };
-                                        ctx.lyric_accent_rgb = provider_accent(&ctx.app_state.lyric_provider);
+                                    UiAction::SettingCycleLyricProvider(delta) => {
+                                        ctx.app_state.lyric_provider =
+                                            cycle_lyric_provider(&ctx.app_state.lyric_provider, delta)
+                                                .to_string();
+                                        ctx.lyric_accent_rgb =
+                                            provider_accent(&ctx.app_state.lyric_provider);
                                         lyrics_mgr.clear_cache();
+                                        ctx.prev_prev_lyric.clear();
+                                        ctx.prev_lyric.clear();
+                                        ctx.cur_lyric.clear();
+                                        ctx.next_lyric.clear();
+                                        ctx.lyric_words.clear();
+                                        ctx.active_word_idx = 0;
+                                        ctx.last_word_idx = 0;
                                         ctx.app_state.save();
                                     }
                                     UiAction::SettingCycleLyricStyle => {
