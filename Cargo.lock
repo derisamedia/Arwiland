@@ -40,12 +40,14 @@ name = "arwiland"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "flate2",
  "fontdue",
  "image",
  "libc",
  "serde",
  "serde_json",
  "tiny-skia",
+ "ttf-parser",
  "windows",
  "winresource",
  "x11rb",

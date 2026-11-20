@@ -69,6 +69,105 @@ fn default_alarm_min() -> u32 {
     0
 }
 
+fn default_accent_color() -> String {
+    "emerald".to_string()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AccentPalette {
+    pub id: &'static str,
+    pub label: &'static str,
+    /// Bright accent for headings, icons, highlights, active bars
+    pub light: (u8, u8, u8),
+    /// Deeper saturated accent for tinted pills, progress fills, gradients
+    pub solid: (u8, u8, u8),
+    /// Extra bright highlight for small badge numbers
+    pub glow: (u8, u8, u8),
+}
+
+impl AccentPalette {
+    pub fn rgb_f64(&self) -> (f64, f64, f64) {
+        (
+            self.light.0 as f64 / 255.0,
+            self.light.1 as f64 / 255.0,
+            self.light.2 as f64 / 255.0,
+        )
+    }
+}
+
+pub const ACCENT_PRESETS: &[AccentPalette] = &[
+    AccentPalette {
+        id: "emerald",
+        label: "HIJAU",
+        light: (52, 211, 153),
+        solid: (16, 185, 129),
+        glow: (64, 235, 173),
+    },
+    AccentPalette {
+        id: "sky",
+        label: "BIRU",
+        light: (56, 189, 248),
+        solid: (14, 165, 233),
+        glow: (103, 212, 255),
+    },
+    AccentPalette {
+        id: "indigo",
+        label: "INDIGO",
+        light: (129, 140, 248),
+        solid: (99, 102, 241),
+        glow: (165, 175, 255),
+    },
+    AccentPalette {
+        id: "violet",
+        label: "UNGU",
+        light: (167, 139, 250),
+        solid: (139, 92, 246),
+        glow: (196, 173, 255),
+    },
+    AccentPalette {
+        id: "pink",
+        label: "PINK",
+        light: (244, 114, 182),
+        solid: (236, 72, 153),
+        glow: (250, 156, 206),
+    },
+    AccentPalette {
+        id: "rose",
+        label: "MERAH",
+        light: (251, 113, 133),
+        solid: (244, 63, 94),
+        glow: (255, 148, 165),
+    },
+    AccentPalette {
+        id: "amber",
+        label: "ORANYE",
+        light: (251, 191, 36),
+        solid: (245, 158, 11),
+        glow: (253, 214, 96),
+    },
+    AccentPalette {
+        id: "teal",
+        label: "CYAN",
+        light: (45, 212, 191),
+        solid: (20, 184, 166),
+        glow: (94, 234, 212),
+    },
+    AccentPalette {
+        id: "mono",
+        label: "PUTIH",
+        light: (244, 244, 245),
+        solid: (212, 212, 216),
+        glow: (255, 255, 255),
+    },
+];
+
+pub fn resolve_accent_palette(id: &str) -> &'static AccentPalette {
+    ACCENT_PRESETS
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(id))
+        .unwrap_or(&ACCENT_PRESETS[0])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub todos: Vec<TodoItem>,
@@ -129,6 +228,8 @@ pub struct AppState {
     pub notif_duration_secs: i32,
     #[serde(default)]
     pub run_on_startup: bool,
+    #[serde(default = "default_accent_color")]
+    pub accent_color: String,
 }
 
 impl Default for AppState {
@@ -185,6 +286,7 @@ impl Default for AppState {
             system_event_notifs: true,
             notif_duration_secs: 5,
             run_on_startup: is_autostart_installed(),
+            accent_color: default_accent_color(),
         }
     }
 }

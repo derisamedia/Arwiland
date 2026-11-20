@@ -11,6 +11,7 @@ use crate::album_art::AlbumArt;
 use crate::lyrics::lyric_provider_label;
 use crate::notifications::IslandNotification;
 use crate::runtime::{ActiveTab, InputField, RuntimeContext, CANVAS_WIDTH, COMPACT_H};
+use crate::state::{resolve_accent_palette, ACCENT_PRESETS};
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HitRect {
@@ -80,6 +81,7 @@ pub enum UiAction {
     SettingYOffset(i32),
     SettingLyricOffset(i32),
     SettingToggleNotif,
+    SettingSelectAccent(usize),
 }
 
 #[derive(Default)]
@@ -1600,10 +1602,9 @@ fn draw_compact_top_bar(
 ) {
     let center_y = bar_y + COMPACT_H as f32 * 0.5;
     let is_playing = ctx.cached_media.has_player && ctx.cached_media.playing;
-    let (ar, ag, ab) = ctx.lyric_accent_rgb;
-    let acc_r = (ar * 255.0) as u8;
-    let acc_g = (ag * 255.0) as u8;
-    let acc_b = (ab * 255.0) as u8;
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
+    let (ar, ag, ab) = pal.rgb_f64();
+    let (acc_r, acc_g, acc_b) = pal.light;
 
     let mut left_cursor = inner_left;
 
@@ -1634,12 +1635,12 @@ fn draw_compact_top_bar(
             if ctx.pomo_break_mode {
                 (251, 191, 36, 250)
             } else {
-                (52, 211, 153, 250)
+                (pal.light.0, pal.light.1, pal.light.2, 250)
             }
         } else if ctx.unread_notif_count > 0 {
-            (52, 211, 153, 242)
+            (pal.light.0, pal.light.1, pal.light.2, 242)
         } else {
-            (130, 140, 248, 224)
+            (pal.light.0, pal.light.1, pal.light.2, 210)
         };
         fill_circle(pixmap, left_cursor + 4.0, center_y, 3.2, dot_col);
         left_cursor += 13.0;
@@ -1651,7 +1652,7 @@ fn draw_compact_top_bar(
         let col = if ctx.pomo_break_mode {
             (253, 224, 71, 255)
         } else {
-            (52, 211, 153, 255)
+            (pal.light.0, pal.light.1, pal.light.2, 255)
         };
         (format!("{:02}:{:02}", m, s), col)
     } else {
@@ -1676,7 +1677,7 @@ fn draw_compact_top_bar(
         let pill_w = (bw + 10.0).max(16.0);
         let pill_h = 16.0;
         let py = center_y - pill_h * 0.5;
-        fill_round_rect(pixmap, left_cursor, py, pill_w, pill_h, 8.0, (16, 185, 129, 68));
+        fill_round_rect(pixmap, left_cursor, py, pill_w, pill_h, 8.0, (pal.solid.0, pal.solid.1, pal.solid.2, 68));
         fonts.draw_text_centered_y(
             pixmap,
             left_cursor + (pill_w - bw) * 0.5,
@@ -1684,7 +1685,7 @@ fn draw_compact_top_bar(
             &b_txt,
             10.5,
             true,
-            (64, 235, 173, 252),
+            (pal.glow.0, pal.glow.1, pal.glow.2, 252),
             None,
         );
         left_cursor += pill_w + 8.0;
@@ -1923,6 +1924,7 @@ fn draw_compact_top_bar(
                 }
             }
         } else {
+            // Static / line-synced lyric (not word-by-word): render clean solid text without karaoke sweep
             let cw_f = fonts.measure_width(&ctx.cur_lyric, lyr_size, true);
             let safe_avail = (lyric_avail_w - 4.0).max(10.0);
             let base_x = if cw_f > safe_avail {
@@ -1938,26 +1940,8 @@ fn draw_compact_top_bar(
                 &ctx.cur_lyric,
                 lyr_size,
                 true,
-                (194, 206, 240, (124.0 * ease) as u8),
+                (250, 252, 255, (248.0 * ease) as u8),
                 Some(lyric_clip),
-            );
-            let sweep_w = (cw_f * (0.12 + 0.88 * ctx.lyric_line_prog as f32)).clamp(0.0, cw_f) + 1.5;
-            let sweep_x0 = base_x.max(lyric_clip.x);
-            let sweep_clip = HitRect::new(
-                sweep_x0,
-                lyric_clip.y,
-                (base_x + sweep_w).min(lyric_clip.x + lyric_clip.w) - sweep_x0,
-                lyric_clip.h,
-            );
-            fonts.draw_text_clipped(
-                pixmap,
-                base_x,
-                baseline,
-                &ctx.cur_lyric,
-                lyr_size,
-                true,
-                (250, 252, 255, (250.0 * ease) as u8),
-                Some(sweep_clip),
             );
         }
     } else {
@@ -1995,10 +1979,11 @@ fn draw_volume_osd(
     h: f32,
 ) {
     let muted = ctx.cur_volume_muted || ctx.cur_volume_pct == 0;
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
     let (vr, vg, vb) = if muted {
         (245u8, 64u8, 94u8)
     } else {
-        (56u8, 189u8, 248u8)
+        pal.light
     };
     let ease = (1.0 - (1.0 - ctx.vol_osd_anim_prog.clamp(0.0, 1.0)).powi(3)) as f32;
     let cy = y0 + h * 0.5;
@@ -2223,6 +2208,7 @@ fn draw_expanded_body(
     }
 
     fill_round_rect(pixmap, x, y, nav_total_w, hdr_h, 15.0, alpha_scale((18, 18, 21, 255), op));
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
 
     let mut tx = x + 3.0;
     for (i, (tid, _)) in tab_defs.iter().enumerate() {
@@ -2233,7 +2219,11 @@ fn draw_expanded_body(
         let hovered = pill_r.contains(ctx.hover_x, ctx.hover_y);
 
         if active {
-            let bg = if has_unread { (52, 211, 153, 255) } else { (244, 244, 245, 255) };
+            let bg = if has_unread {
+                (pal.light.0, pal.light.1, pal.light.2, 255)
+            } else {
+                (244, 244, 245, 255)
+            };
             fill_round_rect(pixmap, pill_r.x, pill_r.y, pill_r.w, pill_r.h, 13.0, alpha_scale(bg, op));
         } else if hovered {
             fill_round_rect(pixmap, pill_r.x, pill_r.y, pill_r.w, pill_r.h, 13.0, alpha_scale((255, 255, 255, 20), op));
@@ -2242,7 +2232,7 @@ fn draw_expanded_body(
         let fg = if active {
             (9, 9, 11, 255)
         } else if has_unread {
-            (52, 211, 153, 255)
+            (pal.light.0, pal.light.1, pal.light.2, 255)
         } else if hovered {
             (244, 244, 245, 255)
         } else {
@@ -2290,14 +2280,14 @@ fn draw_expanded_body(
         let r = HitRect::new(ax, ay, btn_sz, btn_sz);
         let hov = r.contains(ctx.hover_x, ctx.hover_y);
         let bg = if is_on {
-            (16, 185, 129, 54)
+            (pal.solid.0, pal.solid.1, pal.solid.2, 54)
         } else if hov {
             if icon_k == 3 { (244, 63, 94, 72) } else { (31, 31, 35, 255) }
         } else {
             (18, 18, 21, 255)
         };
         let fg = if is_on {
-            (52, 211, 153, 255)
+            (pal.light.0, pal.light.1, pal.light.2, 255)
         } else if hov {
             (244, 244, 245, 255)
         } else {
@@ -2498,18 +2488,18 @@ fn draw_page_media(
     let px = x + 14.0;
     let py = y + 12.0;
     let pw = (w - 28.0).max(80.0);
-    let (ar, ag, ab) = ctx.lyric_accent_rgb;
-    let acc = ((ar * 255.0) as u8, (ag * 255.0) as u8, (ab * 255.0) as u8);
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
+    let acc = pal.light;
 
-    // 58x58 Album Cover Squircle (real artwork when available, emerald music-note fallback otherwise)
+    // 58x58 Album Cover Squircle (real artwork when available, accent music-note fallback otherwise)
     let art_sz = 58.0;
     if let Some(ref art) = ctx.album_art {
         draw_album_art(pixmap, art, px, py, op);
     } else {
         if let Some(art_path) = rounded_rect_path(px, py, art_sz, art_sz, 14.0) {
             let stops = vec![
-                GradientStop::new(0.0, Color::from_rgba8(52, 211, 153, (255.0 * op) as u8)),
-                GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, (255.0 * op) as u8)),
+                GradientStop::new(0.0, Color::from_rgba8(pal.light.0, pal.light.1, pal.light.2, (255.0 * op) as u8)),
+                GradientStop::new(1.0, Color::from_rgba8(pal.solid.0, pal.solid.1, pal.solid.2, (255.0 * op) as u8)),
             ];
             if let Some(grad) = LinearGradient::new(
                 Point::from_xy(px, py),
@@ -2591,7 +2581,7 @@ fn draw_page_media(
         state_word,
         ctx.lyric_provider_badge
     );
-    fonts.draw_text_centered_y(pixmap, tx, py + 9.0, &src_tag, 10.4, true, alpha_scale((52, 211, 153, 250), op), Some(tw));
+    fonts.draw_text_centered_y(pixmap, tx, py + 9.0, &src_tag, 10.4, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 250), op), Some(tw));
     fonts.draw_text_centered_y(pixmap, tx, py + 29.0, &ctx.cached_media.title, 15.2, true, alpha_scale((244, 244, 245, 255), op), Some(tw));
     fonts.draw_text_centered_y(pixmap, tx, py + 47.0, &ctx.cached_media.artist, 12.2, false, alpha_scale((161, 161, 170, 240), op), Some(tw));
 
@@ -2775,18 +2765,23 @@ fn draw_page_media(
             }
         }
     } else {
+        // Static / line-synced lyric (not word-by-word): render clean solid text without karaoke sweep
         let mw = fonts.measure_width(main_txt, main_sz, true);
-        let prog = if !ctx.cur_lyric.is_empty() { ctx.lyric_line_prog.clamp(0.15, 1.0) as f32 } else { 0.46 };
-        let base_x = if mw > pw {
-            px - (mw - pw) * prog
+        let base_x = if mw > pw && !ctx.cur_lyric.is_empty() {
+            px - (mw - pw) * ctx.lyric_line_prog.clamp(0.0, 1.0) as f32
         } else {
             px
         };
-        fonts.draw_text_clipped(pixmap, base_x, ym, main_txt, main_sz, true, alpha_scale((122, 128, 140, 184), op), Some(lyr_clip));
-        let sw_x0 = base_x.max(lyr_clip.x);
-        let sw_x1 = (base_x + mw * prog).min(lyr_clip.x + lyr_clip.w);
-        let sweep_clip = HitRect::new(sw_x0, lyr_clip.y, (sw_x1 - sw_x0).max(0.0), lyr_clip.h);
-        fonts.draw_text_clipped(pixmap, base_x, ym, main_txt, main_sz, true, alpha_scale((250, 252, 255, 252), op), Some(sweep_clip));
+        fonts.draw_text_clipped(
+            pixmap,
+            base_x,
+            ym,
+            main_txt,
+            main_sz,
+            true,
+            alpha_scale((250, 252, 255, 252), op),
+            Some(lyr_clip),
+        );
     }
 
     if !next_txt.is_empty() {
@@ -2813,16 +2808,17 @@ fn draw_page_notif(
     op: f32,
 ) {
     fill_round_rect(pixmap, x, y, w, h, 14.0, alpha_scale((17, 17, 20, 255), op));
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
     let px = x + 14.0;
     let py = y + 10.0;
     let pw = (w - 28.0).max(80.0);
     let head_cy = py + 12.0;
 
-    let title_w = fonts.draw_text_centered_y(pixmap, px, head_cy, "PUSAT NOTIFIKASI", 10.6, true, alpha_scale((52, 211, 153, 255), op), None);
+    let title_w = fonts.draw_text_centered_y(pixmap, px, head_cy, "PUSAT NOTIFIKASI", 10.6, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
     let badge = format!("{} Baru", ctx.unread_notif_count);
     let bw = fonts.measure_width(&badge, 10.2, true) + 14.0;
-    fill_round_rect(pixmap, px + title_w + 8.0, head_cy - 9.0, bw, 18.0, 9.0, alpha_scale((16, 185, 129, 42), op));
-    fonts.draw_text_centered_y(pixmap, px + title_w + 15.0, head_cy, &badge, 10.2, true, alpha_scale((52, 211, 153, 255), op), None);
+    fill_round_rect(pixmap, px + title_w + 8.0, head_cy - 9.0, bw, 18.0, 9.0, alpha_scale((pal.solid.0, pal.solid.1, pal.solid.2, 42), op));
+    fonts.draw_text_centered_y(pixmap, px + title_w + 15.0, head_cy, &badge, 10.2, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
 
     // Right buttons: Tes | Baca Semua | Bersihkan (clean spacing, never collides)
     let w_clear = fonts.measure_width("Bersihkan", 11.2, true) + 18.0;
@@ -2852,7 +2848,7 @@ fn draw_page_notif(
         let card_bg = if item.urgency >= 2 {
             (244, 63, 94, 26)
         } else if !item.read {
-            (16, 185, 129, 22)
+            (pal.solid.0, pal.solid.1, pal.solid.2, 22)
         } else {
             (22, 22, 26, 255)
         };
@@ -2909,6 +2905,7 @@ fn draw_page_focus(
 ) {
     let gap = 10.0;
     let cw = (w - gap) * 0.5;
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
 
     // LEFT CARD: POMODORO FOKUS
     fill_round_rect(pixmap, x, y, cw, h, 14.0, alpha_scale((17, 17, 20, 255), op));
@@ -2917,7 +2914,7 @@ fn draw_page_focus(
     let lw = cw - 26.0;
 
     let ptag = if ctx.pomo_break_mode { "REHAT" } else { "FOKUS" };
-    fonts.draw_text_centered_y(pixmap, lx, ly + 6.0, ptag, 10.4, true, alpha_scale((52, 211, 153, 255), op), None);
+    fonts.draw_text_centered_y(pixmap, lx, ly + 6.0, ptag, 10.4, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
     let sess = format!("{} Sesi", ctx.app_state.pomo_completed_sessions);
     let sw = fonts.measure_width(&sess, 10.6, false);
     fonts.draw_text_centered_y(pixmap, lx + lw - sw, ly + 6.0, &sess, 10.6, false, alpha_scale((161, 161, 170, 220), op), None);
@@ -2950,7 +2947,7 @@ fn draw_page_focus(
         1.0
     };
     fill_round_rect(pixmap, lx, ly + 60.0, lw, 5.0, 2.5, alpha_scale((39, 39, 42, 255), op));
-    fill_round_rect(pixmap, lx, ly + 60.0, (lw * p_frac).max(5.0), 5.0, 2.5, alpha_scale((16, 185, 129, 255), op));
+    fill_round_rect(pixmap, lx, ly + 60.0, (lw * p_frac).max(5.0), 5.0, 2.5, alpha_scale((pal.solid.0, pal.solid.1, pal.solid.2, 255), op));
 
     let btn_y = ly + 76.0;
     let start_lbl = if ctx.pomo_running { "Jeda" } else { "Mulai" };
@@ -2968,7 +2965,7 @@ fn draw_page_focus(
     fill_round_rect(pixmap, rx, y, cw, h, 14.0, alpha_scale((17, 17, 20, 255), op));
     let rlx = rx + 13.0;
 
-    fonts.draw_text_centered_y(pixmap, rlx, ly + 6.0, "ALARM PENGINGAT", 10.4, true, alpha_scale((52, 211, 153, 255), op), None);
+    fonts.draw_text_centered_y(pixmap, rlx, ly + 6.0, "ALARM PENGINGAT", 10.4, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
     let astat = if ctx.alarm_ringing {
         "BERBUNYI!"
     } else if ctx.app_state.alarm_enabled {
@@ -2980,7 +2977,7 @@ fn draw_page_focus(
     let acol = if ctx.alarm_ringing {
         (251, 113, 133, 255)
     } else if ctx.app_state.alarm_enabled {
-        (52, 211, 153, 255)
+        (pal.light.0, pal.light.1, pal.light.2, 255)
     } else {
         (161, 161, 170, 220)
     };
@@ -3013,7 +3010,7 @@ fn draw_page_focus(
 
     fill_round_rect(pixmap, rlx, ly + 60.0, lw, 5.0, 2.5, alpha_scale((39, 39, 42, 255), op));
     if ctx.app_state.alarm_enabled || ctx.alarm_ringing {
-        let bar_col = if ctx.alarm_ringing { (244, 63, 94, 255) } else { (16, 185, 129, 255) };
+        let bar_col = if ctx.alarm_ringing { (244, 63, 94, 255) } else { (pal.solid.0, pal.solid.1, pal.solid.2, 255) };
         fill_round_rect(pixmap, rlx, ly + 60.0, lw, 5.0, 2.5, alpha_scale(bar_col, op));
     }
 
@@ -3046,6 +3043,7 @@ fn draw_page_todo(
     op: f32,
 ) {
     fill_round_rect(pixmap, x, y, w, h, 14.0, alpha_scale((17, 17, 20, 255), op));
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
     let px = x + 14.0;
     let py = y + 10.0;
     let pw = (w - 28.0).max(80.0);
@@ -3082,7 +3080,7 @@ fn draw_page_todo(
     );
     if focused && (ctx.cursor_blink.sin() >= 0.0) {
         let cx = (entry_r.x + 11.0 + text_w + 1.0).min(entry_r.x + entry_w - 8.0);
-        draw_line(pixmap, cx, entry_r.y + 6.0, cx, entry_r.y + 21.0, 1.5, alpha_scale((52, 211, 153, 255), op));
+        draw_line(pixmap, cx, entry_r.y + 6.0, cx, entry_r.y + 21.0, 1.5, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op));
     }
 
     draw_pill_btn(pixmap, fonts, ctx, hitmap, px + entry_w + 8.0, py + 1.0, "+ Tambah", true, op, UiAction::TodoAdd);
@@ -3114,7 +3112,7 @@ fn draw_page_todo(
             15.0,
             15.0,
             4.5,
-            alpha_scale(if item.completed { (16, 185, 129, 255) } else { (39, 39, 42, 255) }, op),
+            alpha_scale(if item.completed { (pal.solid.0, pal.solid.1, pal.solid.2, 255) } else { (39, 39, 42, 255) }, op),
         );
         if item.completed {
             draw_line(pixmap, cb_r.x + 3.5, cb_r.y + 7.8, cb_r.x + 6.5, cb_r.y + 10.8, 1.8, alpha_scale((9, 9, 11, 255), op));
@@ -3158,7 +3156,8 @@ fn draw_page_shelf(
     let pw = (w - 28.0).max(80.0);
 
     fill_round_rect(pixmap, px, py, pw, 34.0, 10.0, alpha_scale((22, 22, 26, 255), op));
-    draw_tab_icon(pixmap, 4, px + 16.0, py + 17.0, alpha_scale((52, 211, 153, 240), op));
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
+    draw_tab_icon(pixmap, 4, px + 16.0, py + 17.0, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 240), op));
     fonts.draw_text_centered_y(
         pixmap,
         px + 30.0,
@@ -3238,7 +3237,8 @@ fn draw_page_prayer(
     draw_pill_btn(pixmap, fonts, ctx, hitmap, px + pw - city_bw, py + 4.0, &city_tr, false, op, UiAction::PrayerCycleCity);
 
     let left_w = (pw - city_bw - 10.0).max(100.0);
-    fonts.draw_text_centered_y(pixmap, px, py + 7.0, "JADWAL SHOLAT", 10.4, true, alpha_scale((52, 211, 153, 255), op), None);
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
+    fonts.draw_text_centered_y(pixmap, px, py + 7.0, "JADWAL SHOLAT", 10.4, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
     let next_str = format!("{} pukul {} ({})", ps.next_prayer_name, ps.next_prayer_time, ps.countdown_str);
     fonts.draw_text_centered_y(pixmap, px, py + 24.0, &next_str, 14.2, true, alpha_scale((244, 244, 245, 255), op), Some(left_w));
 
@@ -3271,7 +3271,7 @@ fn draw_page_prayer(
     let tw = fonts.draw_text_centered_y(pixmap, entry_r.x + 11.0, entry_r.y + entry_r.h * 0.5, disp, 11.8, false, alpha_scale(col, op), Some(entry_w - 22.0));
     if focused && ctx.cursor_blink.sin() >= 0.0 {
         let cx = (entry_r.x + 11.0 + tw + 1.0).min(entry_r.x + entry_w - 8.0);
-        draw_line(pixmap, cx, entry_r.y + 5.5, cx, entry_r.y + 20.5, 1.5, alpha_scale((52, 211, 153, 255), op));
+        draw_line(pixmap, cx, entry_r.y + 5.5, cx, entry_r.y + 20.5, 1.5, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op));
     }
     draw_pill_btn(pixmap, fonts, ctx, hitmap, px + entry_w + 8.0, sy + 0.5, "Cari", true, op, UiAction::PrayerSearchSubmit);
 
@@ -3284,11 +3284,11 @@ fn draw_page_prayer(
     for (i, (name, time_str, _)) in ps.prayers.iter().enumerate() {
         let cx = px + i as f32 * (card_w + gap);
         let is_next = name.eq_ignore_ascii_case(&ps.next_prayer_name);
-        let bg = if is_next { (16, 185, 129, 46) } else { (24, 24, 27, 255) };
+        let bg = if is_next { (pal.solid.0, pal.solid.1, pal.solid.2, 46) } else { (24, 24, 27, 255) };
         fill_round_rect(pixmap, cx, card_y, card_w, card_h, 11.0, alpha_scale(bg, op));
 
         let nw = fonts.measure_width(name, 11.0, true);
-        let ncol = if is_next { (52, 211, 153, 255) } else { (161, 161, 170, 230) };
+        let ncol = if is_next { (pal.light.0, pal.light.1, pal.light.2, 255) } else { (161, 161, 170, 230) };
         fonts.draw_text_centered_y(pixmap, cx + ((card_w - nw) * 0.5).max(3.0), card_y + card_h * 0.34, name, 11.0, true, alpha_scale(ncol, op), Some(card_w - 6.0));
 
         let t_w = fonts.measure_width(time_str, 13.8, true);
@@ -3314,10 +3314,11 @@ fn draw_page_settings(
 ) {
     fill_round_rect(pixmap, x, y, w, h, 14.0, alpha_scale((17, 17, 20, 255), op));
     let px = x + 14.0;
-    let py = y + 10.0;
+    let py = y + 9.0;
     let pw = (w - 28.0).max(80.0);
+    let pal = resolve_accent_palette(&ctx.app_state.accent_color);
 
-    fonts.draw_text_centered_y(pixmap, px, py + 7.0, "PENGATURAN ARWILAND", 10.8, true, alpha_scale((52, 211, 153, 255), op), None);
+    fonts.draw_text_centered_y(pixmap, px, py + 7.0, "PENGATURAN ARWILAND", 10.8, true, alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op), None);
     let m = &ctx.cached_metrics;
     let sys_txt = format!(
         "CPU {:.0}%  •  RAM {:.1}/{:.0}GB  •  Vol {}%",
@@ -3325,6 +3326,67 @@ fn draw_page_settings(
     );
     let sw = fonts.measure_width(&sys_txt, 10.8, false);
     fonts.draw_text_centered_y(pixmap, px + pw - sw, py + 7.0, &sys_txt, 10.8, false, alpha_scale((161, 161, 170, 220), op), None);
+
+    // Full-width Aksen Warna swatch picker (9 curated colors, 1-click live preview)
+    let acc_y = py + 19.0;
+    let acc_h = 31.0;
+    let acc_cy = acc_y + acc_h * 0.5;
+    fill_round_rect(pixmap, px, acc_y, pw, acc_h, 9.5, alpha_scale((22, 22, 26, 255), op));
+    let lbl_w = fonts.draw_text_centered_y(
+        pixmap,
+        px + 11.0,
+        acc_cy,
+        "Aksen Warna",
+        11.6,
+        false,
+        alpha_scale((228, 228, 231, 240), op),
+        None,
+    );
+    let badge_w = fonts.measure_width(pal.label, 10.0, true) + 14.0;
+    fill_round_rect(
+        pixmap,
+        px + 18.0 + lbl_w,
+        acc_cy - 9.0,
+        badge_w,
+        18.0,
+        9.0,
+        alpha_scale((pal.solid.0, pal.solid.1, pal.solid.2, 46), op),
+    );
+    fonts.draw_text_centered_y(
+        pixmap,
+        px + 25.0 + lbl_w,
+        acc_cy,
+        pal.label,
+        10.0,
+        true,
+        alpha_scale((pal.light.0, pal.light.1, pal.light.2, 255), op),
+        None,
+    );
+
+    let swatch_stride = 23.0f32;
+    let swatch_r = 7.2f32;
+    let total_sw_w = (ACCENT_PRESETS.len() as f32 - 1.0) * swatch_stride + swatch_r * 2.0;
+    let mut sx = px + pw - total_sw_w - 11.0 + swatch_r;
+    for (idx, preset) in ACCENT_PRESETS.iter().enumerate() {
+        let hit = HitRect::new(sx - 10.5, acc_cy - 11.0, 21.0, 22.0);
+        let selected = preset.id.eq_ignore_ascii_case(&ctx.app_state.accent_color);
+        let hovered = hit.contains(ctx.hover_x, ctx.hover_y);
+        if selected {
+            stroke_circle(pixmap, sx, acc_cy, swatch_r + 2.6, 1.7, alpha_scale((248, 250, 252, 245), op));
+        } else if hovered {
+            stroke_circle(pixmap, sx, acc_cy, swatch_r + 2.2, 1.3, alpha_scale((200, 204, 214, 175), op));
+        }
+        let r_draw = if selected { swatch_r - 0.5 } else { swatch_r };
+        fill_circle(
+            pixmap,
+            sx,
+            acc_cy,
+            r_draw,
+            alpha_scale((preset.light.0, preset.light.1, preset.light.2, 255), op),
+        );
+        hitmap.push(hit, UiAction::SettingSelectAccent(idx));
+        sx += swatch_stride;
+    }
 
     let col_gap = 12.0;
     let col_w = (pw - col_gap) * 0.5;
@@ -3335,8 +3397,10 @@ fn draw_page_settings(
         "ATAS".to_string()
     };
 
-    let row_h = 34.0;
-    let row_stride = 38.0;
+    let row_h = 31.0;
+    let row_stride = 35.0;
+    let btn_h = 23.0;
+    let btn_y_off = 4.0;
 
     let left_rows: [(&str, String, UiAction); 5] = [
         ("Gaya Island", st.island_style.to_uppercase(), UiAction::SettingCycleIslandStyle),
@@ -3346,56 +3410,56 @@ fn draw_page_settings(
         ("Notifikasi", if st.notif_enabled { "AKTIF".into() } else { "MATI".into() }, UiAction::SettingToggleNotif),
     ];
 
-    let mut ry = py + 21.0;
+    let mut ry = acc_y + acc_h + 6.0;
     for (label, val, act) in left_rows {
         fill_round_rect(pixmap, px, ry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-        fonts.draw_text_centered_y(pixmap, px + 11.0, ry + row_h * 0.5, label, 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-        let bw = (fonts.measure_width(&val, 11.0, true) + 18.0).max(48.0);
-        draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, px + col_w - bw - 6.0, ry + 5.0, 24.0, 9.0, 11.0, &val, false, op, act);
+        fonts.draw_text_centered_y(pixmap, px + 11.0, ry + row_h * 0.5, label, 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+        let bw = (fonts.measure_width(&val, 10.8, true) + 18.0).max(48.0);
+        draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, px + col_w - bw - 6.0, ry + btn_y_off, btn_h, 9.0, 10.8, &val, false, op, act);
         ry += row_stride;
     }
 
     let rx = px + col_w + col_gap;
-    let mut rry = py + 21.0;
+    let mut rry = acc_y + acc_h + 6.0;
 
     // Provider Lirik row: `<` [PROVIDER] `>` so user can cycle all 12 providers forward or backward
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Provider Lirik", 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Provider Lirik", 11.4, false, alpha_scale((228, 228, 231, 240), op), None);
     let prov_lbl = lyric_provider_label(&st.lyric_provider);
-    let w_next = (fonts.measure_width(">", 11.0, true) + 12.0).max(28.0);
-    let w_prev = (fonts.measure_width("<", 11.0, true) + 12.0).max(28.0);
-    let prov_tr = fonts.truncate_to_width(prov_lbl, 10.2, true, 96.0);
-    let w_prov = (fonts.measure_width(&prov_tr, 10.2, true) + 14.0).max(28.0);
+    let w_next = (fonts.measure_width(">", 10.8, true) + 12.0).max(28.0);
+    let w_prev = (fonts.measure_width("<", 10.8, true) + 12.0).max(28.0);
+    let prov_tr = fonts.truncate_to_width(prov_lbl, 10.0, true, 96.0);
+    let w_prov = (fonts.measure_width(&prov_tr, 10.0, true) + 14.0).max(28.0);
     let next_x = rx + col_w - w_next - 6.0;
     let prov_x = next_x - w_prov - 4.0;
     let prev_x = prov_x - w_prev - 4.0;
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prev_x, rry + 5.0, 24.0, 6.0, 11.0, "<", false, op, UiAction::SettingCycleLyricProvider(-1));
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prov_x, rry + 5.0, 24.0, 7.0, 10.2, &prov_tr, false, op, UiAction::SettingCycleLyricProvider(1));
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, next_x, rry + 5.0, 24.0, 6.0, 11.0, ">", false, op, UiAction::SettingCycleLyricProvider(1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prev_x, rry + btn_y_off, btn_h, 6.0, 10.8, "<", false, op, UiAction::SettingCycleLyricProvider(-1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, prov_x, rry + btn_y_off, btn_h, 7.0, 10.0, &prov_tr, false, op, UiAction::SettingCycleLyricProvider(1));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, next_x, rry + btn_y_off, btn_h, 6.0, 10.8, ">", false, op, UiAction::SettingCycleLyricProvider(1));
     rry += row_stride;
 
     // Gaya Lirik row
     let style_val = st.lyric_style.replace('_', " ").to_uppercase();
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Gaya Lirik", 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-    let bw = (fonts.measure_width(&style_val, 10.6, true) + 16.0).max(52.0);
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + 5.0, 24.0, 8.0, 10.6, &style_val, false, op, UiAction::SettingCycleLyricStyle);
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, "Gaya Lirik", 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let bw = (fonts.measure_width(&style_val, 10.4, true) + 16.0).max(52.0);
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - bw - 6.0, rry + btn_y_off, btn_h, 8.0, 10.4, &style_val, false, op, UiAction::SettingCycleLyricStyle);
     rry += row_stride;
 
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Lebar ({}px)", st.compact_width), 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-    let w_plus = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + 5.0, 24.0, 8.0, 12.0, "+", false, op, UiAction::SettingCompactWidth(20));
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_plus - 4.0, rry + 5.0, 24.0, 8.0, 12.0, "-", false, op, UiAction::SettingCompactWidth(-20));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Lebar ({}px)", st.compact_width), 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let w_plus = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + btn_y_off, btn_h, 8.0, 11.8, "+", false, op, UiAction::SettingCompactWidth(20));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_plus - 4.0, rry + btn_y_off, btn_h, 8.0, 11.8, "-", false, op, UiAction::SettingCompactWidth(-20));
     rry += row_stride;
 
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Jarak Y ({}px)", st.y_offset), 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-    let w_yp = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + 5.0, 24.0, 8.0, 12.0, "+", false, op, UiAction::SettingYOffset(4));
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_yp - 4.0, rry + 5.0, 24.0, 8.0, 12.0, "-", false, op, UiAction::SettingYOffset(-4));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Jarak Y ({}px)", st.y_offset), 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let w_yp = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + btn_y_off, btn_h, 8.0, 11.8, "+", false, op, UiAction::SettingYOffset(4));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_yp - 4.0, rry + btn_y_off, btn_h, 8.0, 11.8, "-", false, op, UiAction::SettingYOffset(-4));
     rry += row_stride;
 
     fill_round_rect(pixmap, rx, rry, col_w, row_h, 9.5, alpha_scale((22, 22, 26, 255), op));
-    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Offset ({}ms)", st.lyric_offset_ms), 11.8, false, alpha_scale((228, 228, 231, 240), op), None);
-    let w_p2 = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + 5.0, 24.0, 8.0, 12.0, "+", false, op, UiAction::SettingLyricOffset(100));
-    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_p2 - 4.0, rry + 5.0, 24.0, 8.0, 12.0, "-", false, op, UiAction::SettingLyricOffset(-100));
+    fonts.draw_text_centered_y(pixmap, rx + 11.0, rry + row_h * 0.5, &format!("Offset ({}ms)", st.lyric_offset_ms), 11.6, false, alpha_scale((228, 228, 231, 240), op), None);
+    let w_p2 = draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0, rry + btn_y_off, btn_h, 8.0, 11.8, "+", false, op, UiAction::SettingLyricOffset(100));
+    draw_pill_btn_sized(pixmap, fonts, ctx, hitmap, rx + col_w - 36.0 - w_p2 - 4.0, rry + btn_y_off, btn_h, 8.0, 11.8, "-", false, op, UiAction::SettingLyricOffset(-100));
 }

@@ -47,6 +47,7 @@ pub struct LyricSnapshot {
     pub provider_badge: String,
     #[allow(dead_code)]
     pub provider_detail: String,
+    #[allow(dead_code)]
     pub accent_rgb: (f64, f64, f64),
 }
 
@@ -253,7 +254,7 @@ impl LyricsManager {
                 // Prefer word-synced lines when present, otherwise cleanly display synced LRC lines
                 let has_any_word = lines
                     .iter()
-                    .any(|l| l.is_word_synced && !l.words.is_empty());
+                    .any(|l| l.is_word_synced && l.words.len() >= 2);
                 let active_lines: Vec<&LyricLine> = if has_any_word {
                     lines
                         .iter()
@@ -742,12 +743,13 @@ fn parse_apple_ttml(ttml: &str) -> Vec<LyricLine> {
             if !full_text.is_empty() && !is_metadata_credit_line(&full_text) {
                 let first_start = words.first().map(|w| w.start_sec).unwrap_or(line_begin);
                 let last_end = words.last().map(|w| w.end_sec).unwrap_or(line_end);
+                let real_word_sync = words_are_genuinely_synced(&words);
                 out.push(LyricLine {
                     time_sec: first_start,
                     end_sec: last_end.max(line_end),
                     text: full_text,
-                    words,
-                    is_word_synced: true,
+                    words: if real_word_sync { words } else { Vec::new() },
+                    is_word_synced: real_word_sync,
                 });
             }
         } else {
@@ -891,12 +893,13 @@ fn parse_kugou_krc(krc_text: &str) -> Vec<LyricLine> {
             continue;
         }
 
+        let real_word_sync = words_are_genuinely_synced(&words);
         out.push(LyricLine {
             time_sec: line_start_sec,
             end_sec: line_end_sec,
             text: full_text,
-            words,
-            is_word_synced: true,
+            words: if real_word_sync { words } else { Vec::new() },
+            is_word_synced: real_word_sync,
         });
     }
 
@@ -1011,12 +1014,13 @@ fn parse_netease_yrc(yrc_text: &str) -> Vec<LyricLine> {
 
         let line_start_sec = line_start_ms / 1000.0;
         let line_end_sec = (line_start_ms + dur_ms) / 1000.0;
+        let real_word_sync = words_are_genuinely_synced(&words);
         out.push(LyricLine {
             time_sec: line_start_sec,
             end_sec: line_end_sec,
             text: full_text,
-            words,
-            is_word_synced: true,
+            words: if real_word_sync { words } else { Vec::new() },
+            is_word_synced: real_word_sync,
         });
     }
 
@@ -1237,10 +1241,24 @@ fn parse_youtube_json3_words(json_bytes: &[u8]) -> Vec<LyricLine> {
     out
 }
 
+/// Returns true if a parsed token list represents genuine word/syllable-level timing
+/// rather than an entire sentence stuffed into a single timed span.
+fn words_are_genuinely_synced(words: &[LyricWord]) -> bool {
+    if words.len() >= 2 {
+        return true;
+    }
+    if let Some(only) = words.first() {
+        let t = only.text.trim();
+        !t.is_empty() && !t.contains(char::is_whitespace) && t.chars().count() <= 12
+    } else {
+        false
+    }
+}
+
 fn is_word_synced_state(state: &TrackLyricsState) -> bool {
     match state {
         TrackLyricsState::Synced { lines, .. } => {
-            lines.iter().any(|l| l.is_word_synced && !l.words.is_empty())
+            lines.iter().any(|l| l.is_word_synced && l.words.len() >= 2)
         }
         _ => false,
     }
@@ -1255,10 +1273,14 @@ fn retag_word_state(
     let accent = provider_accent(provider_id);
     match state {
         TrackLyricsState::Synced { mut lines, .. } => {
-            let has_word = lines.iter().any(|l| l.is_word_synced && !l.words.is_empty());
+            let has_word = lines.iter().any(|l| l.is_word_synced && l.words.len() >= 2);
             if has_word {
                 lines.retain(|l| l.is_word_synced && !l.words.is_empty());
             } else {
+                for l in &mut lines {
+                    l.is_word_synced = false;
+                    l.words.clear();
+                }
                 lines.retain(|l| !l.text.trim().is_empty());
             }
             if lines.len() >= 3 {

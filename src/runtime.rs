@@ -4,11 +4,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::album_art::AlbumArt;
-use crate::lyrics::{provider_accent, LyricWord};
+use crate::lyrics::LyricWord;
 use crate::mpris::{query_media_status, MediaStatus};
 use crate::notifications::IslandNotification;
 use crate::prayer::{PrayerRegion, PrayerSchedule};
-use crate::state::AppState;
+use crate::state::{resolve_accent_palette, AppState};
 use crate::sysinfo::{CpuTracker, SystemMetrics};
 
 pub const CANVAS_WIDTH: i32 = 880;
@@ -230,7 +230,7 @@ impl RuntimeContext {
         prayer_region_options: Vec<PrayerRegion>,
     ) -> Self {
         let cw = app_state.compact_width.clamp(250, 420) as f64;
-        let accent = provider_accent(&app_state.lyric_provider);
+        let accent = resolve_accent_palette(&app_state.accent_color).rgb_f64();
         let unread = app_state.notifications.iter().filter(|n| !n.read).count();
         let focus_secs = app_state.pomo_focus_mins.clamp(1, 180) * 60;
         let next_prayer_summary = format!(
@@ -399,7 +399,7 @@ impl RuntimeContext {
                 }
             }
             ActiveTab::Prayer => 248.0,
-            ActiveTab::Settings => 324.0,
+            ActiveTab::Settings => 334.0,
         }
     }
 }

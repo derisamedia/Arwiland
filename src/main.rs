@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 
 use album_art::AlbumArtManager;
-use lyrics::{cycle_lyric_provider, provider_accent, LyricsManager};
+use lyrics::{cycle_lyric_provider, LyricsManager};
 use mpris::{seek_media_to, send_mpris_command};
 use notifications::NotificationHub;
 use prayer::{
@@ -36,7 +36,10 @@ use runtime::{
     spawn_background_monitor, ActiveTab, InputField, RuntimeContext, CANVAS_HEIGHT, CANVAS_WIDTH,
     COMPACT_H, EXPANDED_W, NOTIF_TOAST_H, VOL_OSD_H, VOL_OSD_W,
 };
-use state::{format_file_size, set_autostart_enabled, ShelfFile, TodoItem};
+use state::{
+    format_file_size, resolve_accent_palette, set_autostart_enabled, ShelfFile, TodoItem,
+    ACCENT_PRESETS,
+};
 use sysinfo::{get_live_volume_fast, set_system_volume, toggle_system_mute};
 use ui_renderer::{render_island, FontEngine, UiAction, UiHitMap};
 #[cfg(target_os = "windows")]
@@ -789,8 +792,6 @@ fn main() {
                                         ctx.app_state.lyric_provider =
                                             cycle_lyric_provider(&ctx.app_state.lyric_provider, delta)
                                                 .to_string();
-                                        ctx.lyric_accent_rgb =
-                                            provider_accent(&ctx.app_state.lyric_provider);
                                         lyrics_mgr.clear_cache();
                                         ctx.prev_prev_lyric.clear();
                                         ctx.prev_lyric.clear();
@@ -800,6 +801,13 @@ fn main() {
                                         ctx.active_word_idx = 0;
                                         ctx.last_word_idx = 0;
                                         ctx.app_state.save();
+                                    }
+                                    UiAction::SettingSelectAccent(idx) => {
+                                        if let Some(preset) = ACCENT_PRESETS.get(idx) {
+                                            ctx.app_state.accent_color = preset.id.to_string();
+                                            ctx.lyric_accent_rgb = preset.rgb_f64();
+                                            ctx.app_state.save();
+                                        }
                                     }
                                     UiAction::SettingCycleLyricStyle => {
                                         ctx.app_state.lyric_style = match ctx.app_state.lyric_style.as_str() {
@@ -1423,7 +1431,7 @@ fn main() {
             ctx.word_prog = snap.word_progress;
             ctx.lyric_line_prog = snap.line_progress;
             ctx.lyric_provider_badge = snap.provider_badge;
-            ctx.lyric_accent_rgb = snap.accent_rgb;
+            ctx.lyric_accent_rgb = resolve_accent_palette(&ctx.app_state.accent_color).rgb_f64();
 
             if ctx.lyric_anim_prog < 1.0 {
                 ctx.lyric_anim_prog = (ctx.lyric_anim_prog + dt * 5.6).min(1.0);
